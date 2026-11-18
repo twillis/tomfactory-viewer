@@ -1,6 +1,9 @@
 # tomfactory viewer
 
-A single web page that says "Hello from the factory" and shows how many runs the factory has recorded, which is the number of rows in the `runs` table. Below the count it shows the outcome and reason of the most recent run.
+Two web pages about the factory's runs.
+
+- The home page, at `/`, says "Hello from the factory" and shows how many runs the factory has recorded, which is the number of rows in the `runs` table. Below the count it shows the outcome and reason of the most recent run. It links to the runs page ("All runs").
+- The runs page, at `/runs`, lists every run, newest first. See "All runs" below.
 
 ## Start it
 
@@ -32,7 +35,7 @@ TOMFACTORY_HOME=/path/to/home python viewer.py
 
 The database is opened read-only (`mode=ro`). The viewer never creates the file or its directory and never writes to the database.
 
-The count and the latest run are read afresh on every request, so reloading the page shows the current values. The page does not refresh itself.
+Both pages read the database afresh on every request, so reloading a page shows the current values. The pages do not refresh themselves.
 
 ## Latest run
 
@@ -86,10 +89,50 @@ TOMFACTORY_HOME=/tmp/tf-demo python viewer.py
 
 <http://127.0.0.1:8000/> shows "Runs recorded: 1" and then "Latest run unavailable: …". With `TOMFACTORY_HOME` set to an empty directory, it shows both unavailable lines.
 
+## All runs
+
+<http://127.0.0.1:8000/runs> shows a table with one row per run in the `runs` table, highest `id` first. The home page links to it; the runs page has no link back.
+
+| Column | What it shows |
+| --- | --- |
+| Id | The run's `id`. |
+| Status | The run's `outcome` once it has ended (`accepted`, `rejected` or `needs-me`), and its `state` until then (`planning`, `awaiting_approval` or `working`). A run has ended when its `outcome` is not empty, the same rule the home page uses. |
+| Request | The first 10 words of `request`, followed by `…` if there were more. Line breaks and runs of spaces become single spaces. |
+| Created | `created_at`, in UTC, as `2026-11-18 21:04:05 UTC`. |
+| Duration | For an ended run, `ended_at` minus `created_at`. For a run that has not ended, the time since `created_at`, followed by "so far". |
+
+Durations are in whole seconds, starting at the largest unit that is not zero: `42s`, `3m 7s`, `2h 0m 7s`, `1d 0h 3m 7s`.
+
+Status and request text is HTML-escaped.
+
+In place of the table the page shows:
+
+- **The `runs` table has no rows:**
+
+  > No runs recorded yet
+
+- **The runs could not be read** (the database, the `runs` table, or any of the columns `id`, `state`, `outcome`, `request`, `created_at` and `ended_at` is missing, or the database is locked):
+
+  > Runs unavailable: could not read the runs table
+
+  The page still returns 200. The wording is the same whatever the cause.
+
+Things to know:
+
+- **A run whose driver died** but which has not been marked ended is shown with its stored state and a duration that keeps growing. The page does not check whether the driver is alive. See guarantee 6 in [run-store.md](run-store.md).
+- **Timestamps** are read only in the form `2026-11-18T21:04:05Z`. A timestamp in any other form (fractional seconds, a numeric offset, no `Z`) shows "unknown" under Created, and the Duration that depends on it is also "unknown". The other rows are not affected.
+- **An ended run that ended before it was created**, by its timestamps, shows `0s`, not a negative duration.
+- **There is no paging.** Every run is on the one page, and each request reads the full `request` text of every run.
+- All rows come from one statement on one read-only connection, so a page shows one moment.
+
+### To see it
+
+With a factory database in place, start the viewer and open <http://127.0.0.1:8000/runs>, or follow "All runs" from the home page. With `TOMFACTORY_HOME` set to an empty directory, the page shows the "Runs unavailable" line.
+
 ## Limits
 
 - The server listens on `127.0.0.1` only, so it is reachable from the same machine and not from the network. There is no option to change the address.
-- Only `GET /` is served. Any other path returns 404.
+- Only `GET /` and `GET /runs` are served, with or without a query string. Any other path returns 404, including `/runs/` and `/runs/7`.
 - A database in WAL mode is tested only while another connection has it open. Not tested: a WAL database that nothing else has open, or one in a directory the viewer cannot write to. SQLite may create `factory.db-shm` and `factory.db-wal` beside the database even for a read-only connection, or fail to open it if the directory is not writable; in the second case the page shows the "unavailable" message.
 
 ## Tests
