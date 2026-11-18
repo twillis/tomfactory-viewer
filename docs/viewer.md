@@ -52,17 +52,25 @@ The latest run is the row in `runs` with the highest `id`. The page reads its `o
 
   Only the latest row counts. If it has not ended, the page says so even when older runs have ended. Any text in `reason` is not shown until `outcome` is filled in.
 
-- **There is no run to show**: nothing is added. This happens when the table has no rows, and also when the database, the `runs` table, or either of the `outcome` and `reason` columns is missing. The page does not say which. In the missing-column case the count is still shown, so a count above zero with no latest-run line means the columns could not be read.
+- **There are no runs** (the `runs` table has no rows): nothing is added. The count shows 0.
+
+- **The latest run could not be read** (the database, the `runs` table, or either of the `outcome` and `reason` columns is missing):
+
+  > Latest run unavailable: could not read outcome and reason from the runs table
+
+  In the missing-column case the count is still shown above this line.
 
 The run's id is not shown. Outcome and reason text is HTML-escaped.
 
-The count and the latest run are read on two separate connections, so if a run is recorded between the two reads, one page can show a count and a latest run from slightly different moments. Reload to get a consistent page.
+The count and the latest run are read on one read-only connection, inside one read transaction, so a page shows a count and a latest run from the same moment.
 
 ## When the count is not available
 
 If `factory.db` is missing, is not a SQLite database, or has no `runs` table, the page still loads and shows this in place of the count:
 
 > Run count unavailable: no readable runs table in /path/to/factory.db
+
+The "Latest run unavailable" line appears below it, because the latest run cannot be read either.
 
 The count appears on the next reload once the database is readable.
 
