@@ -3,11 +3,13 @@
 import ast
 import html
 import importlib
+import re
 import sqlite3
 import sys
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1700,3 +1702,1634 @@ def test_viewer_imports_only_the_standard_library(viewer):
     assert imported <= set(sys.stdlib_module_names), (
         f"non-stdlib imports: {sorted(imported - set(sys.stdlib_module_names))}"
     )
+
+
+# ====================================================================================
+# The /runs page: every run, newest first
+# ====================================================================================
+
+# ------------------------------------------------------------ helpers for /runs tests
+
+# The ``runs`` table and its index, exactly as docs/run-store.md gives them. The index
+# allows at most one run that has not ended, so tests insert at most one such run.
+RUNS_DDL = """
+CREATE TABLE runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    request         TEXT    NOT NULL,
+    target          TEXT    NOT NULL,
+    base_commit     TEXT    NOT NULL,
+    branch          TEXT,
+    workspace       TEXT,
+    state           TEXT    NOT NULL CHECK (state IN ('planning','awaiting_approval','working','ended')),
+    current_step    TEXT,
+    outcome         TEXT    CHECK (outcome IN ('accepted','rejected','needs-me')),
+    reason          TEXT,
+    ideals          TEXT    NOT NULL DEFAULT '',
+    attempt_limit   INTEGER NOT NULL DEFAULT 3,
+    driver_pid      INTEGER,
+    driver_started  TEXT,
+    child_pgid      INTEGER,
+    created_at      TEXT    NOT NULL,
+    ended_at        TEXT,
+    CHECK ((state = 'ended') = (outcome IS NOT NULL))
+);
+CREATE UNIQUE INDEX one_open_run ON runs ((state != 'ended')) WHERE state != 'ended';
+"""
+
+CREATED = "2026-11-18T21:04:05Z"
+ENDED = "2026-11-18T21:07:12Z"  # 3m 7s after CREATED
+CREATED_DT = datetime(2026, 11, 18, 21, 4, 5, tzinfo=timezone.utc)
+ENDED_DT = CREATED_DT + timedelta(seconds=187)
+CREATED_TEXT = "2026-11-18 21:04:05 UTC"
+
+# Keyword arguments for ``insert_full_run`` that make the run one that has not ended.
+RUNNING = {"state": "working", "outcome": None, "ended_at": None}
+
+TEN_WORDS = "one two three four five six seven eight nine ten"
+
+RUNS_LINK_LINE = '<p><a id="runs-link" href="/runs">All runs</a></p>\n'
+NO_RUNS_LINE = '<p id="no-runs">No runs recorded yet</p>\n'
+RUNS_UNAVAILABLE_LINE = (
+    '<p id="runs-unavailable">Runs unavailable: could not read the runs table</p>\n'
+)
+RUNS_HEAD = (
+    "<!doctype html>\n"
+    '<html lang="en">\n'
+    "<head>\n"
+    '<meta charset="utf-8">\n'
+    "<title>Runs - tomfactory viewer</title>\n"
+    "</head>\n"
+    "<body>\n"
+    "<h1>Runs</h1>\n"
+)
+RUNS_TABLE_OPEN = (
+    '<table id="runs">\n'
+    "<thead>\n"
+    "<tr><th>Id</th><th>Status</th><th>Request</th><th>Created</th>"
+    "<th>Duration</th></tr>\n"
+    "</thead>\n"
+    "<tbody>\n"
+)
+RUNS_TABLE_CLOSE = "</tbody>\n</table>\n"
+DOCUMENT_TAIL = "</body>\n</html>\n"
+
+
+def run_row(run_id, status, request, created=CREATED_TEXT, duration="3m 7s"):
+    """The table line the /runs page shows for one run; the texts are already escaped."""
+    return (
+        f'<tr id="run-{run_id}">'
+        f'<td class="run-id">{run_id}</td>'
+        f'<td class="run-status">{status}</td>'
+        f'<td class="run-request">{request}</td>'
+        f'<td class="run-created">{created}</td>'
+        f'<td class="run-duration">{duration}</td>'
+        "</tr>\n"
+    )
+
+
+def request_cell(text):
+    return f'<td class="run-request">{text}</td>'
+
+
+def duration_cell(text):
+    return f'<td class="run-duration">{text}</td>'
+
+
+def insert_full_run(
+    path,
+    run_id=None,
+    request="Fix the bug",
+    state="ended",
+    outcome="accepted",
+    created_at=CREATED,
+    ended_at=ENDED,
+):
+    """Insert one row into a ``runs`` table made from ``RUNS_DDL``; ended by default."""
+    execute_sql(
+        path,
+        "INSERT INTO runs "
+        "(id, request, target, base_commit, state, outcome, created_at, ended_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_id, request, "/tmp/target", "abc123", state, outcome, created_at, ended_at),
+    )
+
+
+def make_runs_db(home, runs=()):
+    """Create ``home/factory.db`` with the documented ``runs`` table.
+
+    ``runs`` is a sequence of keyword-argument mappings for ``insert_full_run``,
+    inserted in order.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "factory.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(RUNS_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+    for run in runs:
+        insert_full_run(path, **run)
+    return path
+
+
+def ended_summary(
+    viewer,
+    run_id=7,
+    outcome="accepted",
+    request="Fix the bug",
+    created_at=CREATED_DT,
+    ended_at=ENDED_DT,
+    state="ended",
+):
+    return viewer.RunSummary(run_id, state, outcome, request, created_at, ended_at)
+
+
+def running_summary(
+    viewer, run_id=7, state="working", request="Fix the bug", created_at=CREATED_DT
+):
+    return viewer.RunSummary(run_id, state, "", request, created_at, None)
+
+
+def render_runs(viewer, runs, read_at=ENDED_DT):
+    """Render the /runs page for hand-built runs and a fixed read time."""
+    return viewer.render_runs_page(viewer.RunsPageData(tuple(runs), read_at))
+
+
+def _make_runs_table_without_ended_at(home):
+    path = make_db(home, with_runs_table=False)
+    execute_sql(
+        path,
+        "CREATE TABLE runs (id INTEGER PRIMARY KEY, state TEXT, outcome TEXT, "
+        "request TEXT, created_at TEXT)",
+    )
+    execute_sql(
+        path,
+        "INSERT INTO runs (state, outcome, request, created_at) "
+        "VALUES ('ended', 'accepted', 'Fix the bug', ?)",
+        (CREATED,),
+    )
+
+
+def _make_runs_table_without_request(home):
+    path = make_db(home, with_runs_table=False)
+    execute_sql(
+        path,
+        "CREATE TABLE runs (id INTEGER PRIMARY KEY, state TEXT, outcome TEXT, "
+        "created_at TEXT, ended_at TEXT)",
+    )
+    execute_sql(
+        path,
+        "INSERT INTO runs (state, outcome, created_at, ended_at) "
+        "VALUES ('ended', 'accepted', ?, ?)",
+        (CREATED, ENDED),
+    )
+
+
+def _make_runs_table_with_only_an_id(home):
+    make_db(home, rows=3)
+
+
+def _make_runs_table_with_only_outcome_and_reason(home):
+    make_outcome_db(home, [("accepted", "all green")])
+
+
+UNREADABLE_RUNS_DATABASES = UNREADABLE_DATABASES + [
+    pytest.param(_make_runs_table_without_ended_at, id="runs_has_no_ended_at_column"),
+    pytest.param(_make_runs_table_without_request, id="runs_has_no_request_column"),
+    pytest.param(_make_runs_table_with_only_an_id, id="runs_has_only_an_id_column"),
+    pytest.param(
+        _make_runs_table_with_only_outcome_and_reason,
+        id="runs_has_only_outcome_and_reason_columns",
+    ),
+]
+
+
+class BrokenCursor:
+    """A cursor whose every way of reading rows fails."""
+
+    def _fail(self, *args, **kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    __iter__ = fetchone = fetchall = fetchmany = _fail
+
+
+class BrokenConnection:
+    """A connection whose statement fails, or whose rows cannot be fetched."""
+
+    def __init__(self, real, fail_on):
+        self._real = real
+        self._fail_on = fail_on
+        self.close_calls = 0
+
+    def execute(self, sql, *args, **kwargs):
+        if self._fail_on == "execute":
+            raise sqlite3.OperationalError("database is locked")
+        return BrokenCursor()
+
+    def close(self):
+        self.close_calls += 1
+        self._real.close()
+
+
+def break_connections(viewer, monkeypatch, fail_on):
+    """Make ``viewer.sqlite3.connect`` return broken connections; return those made."""
+    made = []
+    real_connect = sqlite3.connect
+
+    def breaking_connect(*args, **kwargs):
+        broken = BrokenConnection(real_connect(*args, **kwargs), fail_on)
+        made.append(broken)
+        return broken
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", breaking_connect)
+    return made
+
+
+# ---------------------------------------------------- RunSummary and RunsPageData
+
+
+def test_run_summary_has_its_six_fields_in_order(viewer):
+    assert viewer.RunSummary._fields == (
+        "id",
+        "state",
+        "outcome",
+        "request",
+        "created_at",
+        "ended_at",
+    )
+
+
+def test_run_summary_keeps_the_values_it_is_given(viewer):
+    run = viewer.RunSummary(7, "ended", "accepted", "Fix the bug", CREATED_DT, ENDED_DT)
+    assert run.id == 7
+    assert run.state == "ended"
+    assert run.outcome == "accepted"
+    assert run.request == "Fix the bug"
+    assert run.created_at == CREATED_DT
+    assert run.ended_at == ENDED_DT
+
+
+def test_runs_page_data_has_runs_and_read_at_fields_in_that_order(viewer):
+    data = viewer.RunsPageData((), CREATED_DT)
+    assert viewer.RunsPageData._fields == ("runs", "read_at")
+    assert data.runs == ()
+    assert data.read_at == CREATED_DT
+
+
+def test_runs_page_data_requires_read_at_to_be_given(viewer):
+    runs_page_data = viewer.RunsPageData
+    with pytest.raises(TypeError):
+        runs_page_data(())
+
+
+# ------------------------------------------------------ RunSummary: ended and status
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "rejected", "needs-me"])
+def test_run_summary_with_an_outcome_has_ended_and_its_status_is_the_outcome(
+    viewer, outcome
+):
+    run = ended_summary(viewer, outcome=outcome)
+    assert run.ended is True
+    assert run.status == outcome
+
+
+@pytest.mark.parametrize("state", ["planning", "awaiting_approval", "working"])
+def test_run_summary_without_an_outcome_has_not_ended_and_its_status_is_the_state(
+    viewer, state
+):
+    run = running_summary(viewer, state=state)
+    assert run.ended is False
+    assert run.status == state
+
+
+def test_run_summary_ended_is_decided_by_the_outcome_not_the_state(viewer):
+    stale_state = ended_summary(viewer, state="working", outcome="rejected")
+    assert stale_state.ended is True
+    assert stale_state.status == "rejected"
+
+    no_outcome = viewer.RunSummary(7, "ended", "", "Fix the bug", CREATED_DT, ENDED_DT)
+    assert no_outcome.ended is False
+    assert no_outcome.status == "ended"
+
+
+# ------------------------------------------------------------ RunSummary: duration
+
+
+def test_run_summary_duration_of_an_ended_run_is_from_created_to_ended(viewer):
+    run = ended_summary(viewer)
+    assert run.duration(ENDED_DT) == timedelta(seconds=187)
+
+
+def test_run_summary_duration_of_an_ended_run_ignores_now(viewer):
+    run = ended_summary(viewer)
+    much_later = ENDED_DT + timedelta(days=400)
+    assert run.duration(much_later) == timedelta(seconds=187)
+    assert run.duration(CREATED_DT - timedelta(days=1)) == timedelta(seconds=187)
+
+
+def test_run_summary_duration_of_a_running_run_is_from_created_to_now(viewer):
+    run = running_summary(viewer)
+    assert run.duration(CREATED_DT + timedelta(hours=2, seconds=7)) == timedelta(
+        hours=2, seconds=7
+    )
+
+
+def test_run_summary_duration_of_a_running_run_grows_with_now(viewer):
+    run = running_summary(viewer)
+    earlier = run.duration(CREATED_DT + timedelta(seconds=10))
+    later = run.duration(CREATED_DT + timedelta(seconds=11))
+    assert later - earlier == timedelta(seconds=1)
+
+
+def test_run_summary_duration_is_none_for_an_ended_run_without_created_at(viewer):
+    run = ended_summary(viewer, created_at=None)
+    assert run.duration(ENDED_DT) is None
+
+
+def test_run_summary_duration_is_none_for_a_running_run_without_created_at(viewer):
+    run = running_summary(viewer, created_at=None)
+    assert run.duration(ENDED_DT) is None
+
+
+def test_run_summary_duration_is_none_for_an_ended_run_without_ended_at(viewer):
+    run = ended_summary(viewer, ended_at=None)
+    assert run.duration(ENDED_DT + timedelta(days=1)) is None
+
+
+def test_run_summary_duration_is_none_when_both_times_are_missing(viewer):
+    run = ended_summary(viewer, created_at=None, ended_at=None)
+    assert run.duration(ENDED_DT) is None
+
+
+def test_run_summary_duration_is_zero_when_an_ended_run_ended_before_it_was_created(
+    viewer,
+):
+    run = ended_summary(viewer, ended_at=CREATED_DT - timedelta(seconds=30))
+    assert run.duration(ENDED_DT) == timedelta(0)
+
+
+def test_run_summary_duration_is_zero_when_now_is_before_a_running_run_was_created(
+    viewer,
+):
+    run = running_summary(viewer)
+    assert run.duration(CREATED_DT - timedelta(seconds=30)) == timedelta(0)
+
+
+def test_run_summary_duration_is_zero_when_a_run_ended_the_moment_it_was_created(
+    viewer,
+):
+    run = ended_summary(viewer, ended_at=CREATED_DT)
+    assert run.duration(ENDED_DT) == timedelta(0)
+
+
+# ------------------------------------------- read_runs_page_data: readable states
+
+
+def test_read_runs_page_data_returns_a_runs_page_data(viewer, home):
+    make_runs_db(home, [{}])
+    assert isinstance(viewer.read_runs_page_data(), viewer.RunsPageData)
+
+
+def test_read_runs_page_data_runs_is_a_tuple_of_run_summaries(viewer, home):
+    make_runs_db(home, [{}, RUNNING])
+    runs = viewer.read_runs_page_data().runs
+    assert type(runs) is tuple
+    assert len(runs) == 2
+    assert all(isinstance(run, viewer.RunSummary) for run in runs)
+
+
+def test_read_runs_page_data_maps_every_field_of_an_ended_run(viewer, home):
+    make_runs_db(
+        home,
+        [{"run_id": 7, "request": "Add a page at /runs", "outcome": "rejected"}],
+    )
+    assert viewer.read_runs_page_data().runs == (
+        viewer.RunSummary(
+            7, "ended", "rejected", "Add a page at /runs", CREATED_DT, ENDED_DT
+        ),
+    )
+
+
+def test_read_runs_page_data_gives_a_running_run_empty_outcome_and_no_ended_at(
+    viewer, home
+):
+    make_runs_db(home, [{"run_id": 4, "request": "Still going", **RUNNING}])
+    (run,) = viewer.read_runs_page_data().runs
+    assert run == viewer.RunSummary(4, "working", "", "Still going", CREATED_DT, None)
+    assert run.outcome == ""
+    assert run.ended_at is None
+
+
+@pytest.mark.parametrize("state", ["planning", "awaiting_approval", "working"])
+def test_read_runs_page_data_returns_the_stored_state_of_a_run_that_has_not_ended(
+    viewer, home, state
+):
+    make_runs_db(home, [{"state": state, "outcome": None, "ended_at": None}])
+    (run,) = viewer.read_runs_page_data().runs
+    assert run.state == state
+    assert run.outcome == ""
+
+
+def test_read_runs_page_data_id_is_an_int(viewer, home):
+    make_runs_db(home, [{"run_id": 12}])
+    (run,) = viewer.read_runs_page_data().runs
+    assert type(run.id) is int
+    assert run.id == 12
+
+
+def test_read_runs_page_data_returns_runs_highest_id_first(viewer, home):
+    make_runs_db(home, [{"request": "first"}, {"request": "second"}, RUNNING])
+    runs = viewer.read_runs_page_data().runs
+    assert [run.id for run in runs] == [3, 2, 1]
+    assert [run.request for run in runs][1:] == ["second", "first"]
+
+
+def test_read_runs_page_data_orders_by_id_not_by_insertion_order(viewer, home):
+    make_runs_db(home, [{"run_id": 50}, {"run_id": 7}, {"run_id": 200}, {"run_id": 9}])
+    runs = viewer.read_runs_page_data().runs
+    assert [run.id for run in runs] == [200, 50, 9, 7]
+
+
+def test_read_runs_page_data_orders_by_id_not_by_created_at(viewer, home):
+    make_runs_db(
+        home,
+        [
+            {"run_id": 1, "created_at": "2030-01-01T00:00:00Z", "ended_at": None},
+            {"run_id": 2, "created_at": "2020-01-01T00:00:00Z", "ended_at": None},
+        ],
+    )
+    assert [run.id for run in viewer.read_runs_page_data().runs] == [2, 1]
+
+
+def test_read_runs_page_data_returns_a_single_run(viewer, home):
+    make_runs_db(home, [{}])
+    assert len(viewer.read_runs_page_data().runs) == 1
+
+
+def test_read_runs_page_data_returns_every_run_when_there_are_many(viewer, home):
+    path = make_runs_db(home)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executemany(
+            "INSERT INTO runs "
+            "(request, target, base_commit, state, outcome, created_at, ended_at) "
+            "VALUES (?, '/tmp/target', 'abc123', 'ended', 'accepted', ?, ?)",
+            [(f"request number {n}", CREATED, ENDED) for n in range(1, 301)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    runs = viewer.read_runs_page_data().runs
+    assert len(runs) == 300
+    assert [run.id for run in runs] == list(range(300, 0, -1))
+    assert runs[0].request == "request number 300"
+    assert runs[-1].request == "request number 1"
+
+
+def test_read_runs_page_data_returns_the_request_in_full_and_unchanged(viewer, home):
+    request = "  <b>café</b> & 'quotes' ✓\n\nsecond paragraph " + "word " * 200
+    make_runs_db(home, [{"request": request}])
+    (run,) = viewer.read_runs_page_data().runs
+    assert run.request == request
+
+
+def test_read_runs_page_data_works_when_home_path_contains_a_space(
+    viewer, tmp_path, monkeypatch
+):
+    spaced = tmp_path / "factory home"
+    make_runs_db(spaced, [{}, {}])
+    monkeypatch.setenv("TOMFACTORY_HOME", str(spaced))
+    assert [run.id for run in viewer.read_runs_page_data().runs] == [2, 1]
+
+
+def test_read_runs_page_data_gives_empty_strings_and_none_for_null_columns(
+    viewer, home
+):
+    # A looser table than the documented one: every column the page reads is NULL.
+    path = make_db(home, with_runs_table=False)
+    execute_sql(
+        path,
+        "CREATE TABLE runs (id INTEGER PRIMARY KEY, state TEXT, outcome TEXT, "
+        "request TEXT, created_at TEXT, ended_at TEXT)",
+    )
+    execute_sql(path, "INSERT INTO runs DEFAULT VALUES")
+    assert viewer.read_runs_page_data().runs == (
+        viewer.RunSummary(1, "", "", "", None, None),
+    )
+
+
+# ------------------------------------------------- read_runs_page_data: timestamps
+
+
+def test_read_runs_page_data_parses_timestamps_as_utc_aware_datetimes(viewer, home):
+    make_runs_db(home, [{}])
+    (run,) = viewer.read_runs_page_data().runs
+    assert isinstance(run.created_at, datetime)
+    assert isinstance(run.ended_at, datetime)
+    assert run.created_at.utcoffset() == timedelta(0)
+    assert run.ended_at.utcoffset() == timedelta(0)
+    assert run.created_at == CREATED_DT
+    assert run.ended_at == ENDED_DT
+
+
+MALFORMED_TIMES = [
+    pytest.param("yesterday", id="words"),
+    pytest.param("", id="empty_string"),
+    pytest.param("2026-11-18 21:04:05", id="space_and_no_z"),
+    pytest.param("2026-11-18T21:04:05", id="no_z"),
+    pytest.param("2026-11-18T21:04:05+00:00", id="numeric_offset"),
+    pytest.param("2026-11-18T21:04:05.250Z", id="fractional_seconds"),
+    pytest.param("2026-13-45T99:99:99Z", id="impossible_date"),
+    pytest.param("2026-11-18", id="date_only"),
+    pytest.param("1763500000", id="epoch_seconds"),
+    pytest.param(b"\x00\x01binary", id="blob"),
+]
+
+
+@pytest.mark.parametrize("stored", MALFORMED_TIMES)
+def test_read_runs_page_data_created_at_is_none_when_stored_as(viewer, home, stored):
+    make_runs_db(home, [{"request": "Odd time", "created_at": stored}])
+    data = viewer.read_runs_page_data()
+    assert data.runs == (
+        viewer.RunSummary(1, "ended", "accepted", "Odd time", None, ENDED_DT),
+    )
+
+
+@pytest.mark.parametrize("stored", MALFORMED_TIMES)
+def test_read_runs_page_data_ended_at_is_none_when_stored_as(viewer, home, stored):
+    make_runs_db(home, [{"request": "Odd time", "ended_at": stored}])
+    data = viewer.read_runs_page_data()
+    assert data.runs == (
+        viewer.RunSummary(1, "ended", "accepted", "Odd time", CREATED_DT, None),
+    )
+
+
+def test_read_runs_page_data_keeps_other_runs_when_one_has_a_malformed_time(
+    viewer, home
+):
+    make_runs_db(home, [{}, {"created_at": "garbage"}, {}])
+    runs = viewer.read_runs_page_data().runs
+    assert [run.id for run in runs] == [3, 2, 1]
+    assert [run.created_at for run in runs] == [CREATED_DT, None, CREATED_DT]
+
+
+# ------------------------------------------------ read_runs_page_data: empty table
+
+
+def test_read_runs_page_data_gives_an_empty_tuple_for_an_empty_runs_table(viewer, home):
+    make_runs_db(home)
+    runs = viewer.read_runs_page_data().runs
+    assert runs == ()
+    assert type(runs) is tuple
+    assert runs is not viewer.UNREADABLE
+
+
+# ------------------------------------------------- read_runs_page_data: unreadable
+
+
+@pytest.mark.parametrize("break_database", UNREADABLE_RUNS_DATABASES)
+def test_read_runs_page_data_runs_is_unreadable_when(viewer, home, break_database):
+    break_database(home)
+    data = viewer.read_runs_page_data()
+    assert isinstance(data, viewer.RunsPageData)
+    assert data.runs is viewer.UNREADABLE
+    assert data.runs != ()
+
+
+def test_read_runs_page_data_runs_is_unreadable_when_home_directory_is_missing(
+    viewer, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TOMFACTORY_HOME", str(tmp_path / "does-not-exist"))
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+
+
+def test_read_runs_page_data_runs_is_unreadable_when_connect_raises(
+    viewer, home, monkeypatch
+):
+    make_runs_db(home, [{}])
+
+    def failing_connect(*args, **kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", failing_connect)
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+
+
+def test_read_runs_page_data_runs_is_unreadable_when_the_statement_fails(
+    viewer, home, monkeypatch
+):
+    make_runs_db(home, [{}])
+    made = break_connections(viewer, monkeypatch, fail_on="execute")
+
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+    assert len(made) == 1
+    assert made[0].close_calls == 1
+
+
+def test_read_runs_page_data_runs_is_unreadable_when_fetching_rows_fails(
+    viewer, home, monkeypatch
+):
+    make_runs_db(home, [{}])
+    made = break_connections(viewer, monkeypatch, fail_on="fetch")
+
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+    assert len(made) == 1
+    assert made[0].close_calls == 1
+
+
+# ----------------------------------------------------- read_runs_page_data: read_at
+
+
+def test_read_runs_page_data_read_at_is_the_utc_time_of_the_call(viewer, home):
+    make_runs_db(home, [{}])
+    before = datetime.now(timezone.utc)
+    data = viewer.read_runs_page_data()
+    after = datetime.now(timezone.utc)
+    assert data.read_at.utcoffset() == timedelta(0)
+    assert before <= data.read_at <= after
+
+
+def test_read_runs_page_data_read_at_is_set_when_the_runs_are_unreadable(viewer, home):
+    before = datetime.now(timezone.utc)
+    data = viewer.read_runs_page_data()
+    after = datetime.now(timezone.utc)
+    assert data.runs is viewer.UNREADABLE
+    assert data.read_at.utcoffset() == timedelta(0)
+    assert before <= data.read_at <= after
+
+
+def test_read_runs_page_data_read_at_is_set_for_an_empty_runs_table(viewer, home):
+    make_runs_db(home)
+    before = datetime.now(timezone.utc)
+    data = viewer.read_runs_page_data()
+    after = datetime.now(timezone.utc)
+    assert data.runs == ()
+    assert before <= data.read_at <= after
+
+
+def test_read_runs_page_data_read_at_does_not_go_backwards_between_calls(viewer, home):
+    make_runs_db(home, [{}])
+    first = viewer.read_runs_page_data()
+    second = viewer.read_runs_page_data()
+    assert first.read_at <= second.read_at
+
+
+# ---------------------------------- read_runs_page_data: one read-only connection
+
+
+def test_read_runs_page_data_opens_one_read_only_connection(viewer, home, monkeypatch):
+    make_runs_db(home, [{}, {}, RUNNING])
+    calls = record_connects(viewer, monkeypatch)
+
+    assert len(viewer.read_runs_page_data().runs) == 3
+    assert_one_read_only_connect(calls)
+
+
+def test_read_runs_page_data_opens_one_read_only_connection_for_an_empty_runs_table(
+    viewer, home, monkeypatch
+):
+    make_runs_db(home)
+    calls = record_connects(viewer, monkeypatch)
+
+    assert viewer.read_runs_page_data().runs == ()
+    assert_one_read_only_connect(calls)
+
+
+def test_read_runs_page_data_tries_to_connect_only_once_when_the_database_is_missing(
+    viewer, home, monkeypatch
+):
+    calls = record_connects(viewer, monkeypatch)
+
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+    assert_one_read_only_connect(calls)
+
+
+def test_read_runs_page_data_opens_one_connection_per_call(viewer, home, monkeypatch):
+    make_runs_db(home, [{}])
+    calls = record_connects(viewer, monkeypatch)
+
+    viewer.read_runs_page_data()
+    viewer.read_runs_page_data()
+    assert len(calls) == 2
+
+
+def test_read_runs_page_data_closes_its_connection_once_after_a_successful_read(
+    viewer, home, monkeypatch
+):
+    make_runs_db(home, [{}, {}])
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert len(viewer.read_runs_page_data().runs) == 2
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+def test_read_runs_page_data_closes_its_connection_when_the_table_is_missing(
+    viewer, home, monkeypatch
+):
+    make_db(home, with_runs_table=False)
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+def test_read_runs_page_data_closes_its_connection_when_a_column_is_missing(
+    viewer, home, monkeypatch
+):
+    _make_runs_table_without_ended_at(home)
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+# ----------------------------------- read_runs_page_data: never writes or creates
+
+
+def test_read_runs_page_data_does_not_create_a_missing_database_file(viewer, home):
+    viewer.read_runs_page_data()
+    viewer.read_runs_page_data()
+    assert not (home / "factory.db").exists()
+    assert list(home.iterdir()) == []
+
+
+def test_read_runs_page_data_does_not_create_a_missing_home_directory(
+    viewer, tmp_path, monkeypatch
+):
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setenv("TOMFACTORY_HOME", str(missing))
+    viewer.read_runs_page_data()
+    assert not missing.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_read_runs_page_data_leaves_the_database_file_unchanged(viewer, home):
+    path = make_runs_db(home, [{}, {}, RUNNING])
+    before = path.read_bytes()
+    assert len(viewer.read_runs_page_data().runs) == 3
+    assert len(viewer.read_runs_page_data().runs) == 3
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_runs_page_data_leaves_an_empty_runs_table_unchanged(viewer, home):
+    path = make_runs_db(home)
+    before = path.read_bytes()
+    assert viewer.read_runs_page_data().runs == ()
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_runs_page_data_leaves_a_non_sqlite_file_unchanged(viewer, home):
+    _write_non_sqlite_file(home)
+    path = home / "factory.db"
+    before = path.read_bytes()
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_runs_page_data_leaves_an_empty_database_file_empty(viewer, home):
+    _write_empty_file(home)
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+    assert (home / "factory.db").read_bytes() == b""
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+# ------------------------------------------------ read_runs_page_data: between calls
+
+
+def test_read_runs_page_data_called_twice_returns_the_same_runs(viewer, home):
+    make_runs_db(home, [{}, RUNNING])
+    first = viewer.read_runs_page_data()
+    second = viewer.read_runs_page_data()
+    assert first.runs == second.runs
+    assert len(first.runs) == 2
+
+
+def test_read_runs_page_data_sees_a_newly_inserted_run_on_the_next_call(viewer, home):
+    path = make_runs_db(home, [{}])
+    assert [run.id for run in viewer.read_runs_page_data().runs] == [1]
+    insert_full_run(path, request="A newer run", **RUNNING)
+    runs = viewer.read_runs_page_data().runs
+    assert [run.id for run in runs] == [2, 1]
+    assert runs[0].request == "A newer run"
+
+
+def test_read_runs_page_data_sees_a_run_ending_on_the_next_call(viewer, home):
+    path = make_runs_db(home, [RUNNING])
+    (before,) = viewer.read_runs_page_data().runs
+    assert before.outcome == ""
+    assert before.ended_at is None
+
+    execute_sql(
+        path,
+        "UPDATE runs SET state = 'ended', outcome = 'needs-me', ended_at = ?",
+        (ENDED,),
+    )
+
+    (after,) = viewer.read_runs_page_data().runs
+    assert after == viewer.RunSummary(
+        1, "ended", "needs-me", "Fix the bug", CREATED_DT, ENDED_DT
+    )
+
+
+def test_read_runs_page_data_recovers_once_the_database_appears(viewer, home):
+    assert viewer.read_runs_page_data().runs is viewer.UNREADABLE
+    make_runs_db(home, [{}])
+    assert [run.id for run in viewer.read_runs_page_data().runs] == [1]
+
+
+def test_read_runs_page_data_reads_the_environment_on_every_call(
+    viewer, tmp_path, monkeypatch
+):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    make_runs_db(first, [{"request": "from first"}])
+    make_runs_db(second, [{}, {"request": "from second"}])
+    monkeypatch.setenv("TOMFACTORY_HOME", str(first))
+    assert [run.request for run in viewer.read_runs_page_data().runs] == ["from first"]
+    monkeypatch.setenv("TOMFACTORY_HOME", str(second))
+    assert viewer.read_runs_page_data().runs[0].request == "from second"
+
+
+def test_read_page_data_still_reads_the_documented_runs_table(viewer, home):
+    make_runs_db(home, [{}, RUNNING])
+    assert viewer.read_page_data() == viewer.PageData(2, viewer.LatestRun("", ""))
+    assert len(viewer.read_runs_page_data().runs) == 2
+
+
+# --------------------------------------------------- render_runs_page: the document
+
+
+def test_render_runs_page_with_one_run_is_exactly_the_planned_document(viewer):
+    page = render_runs(viewer, [ended_summary(viewer)])
+    assert page == (
+        RUNS_HEAD
+        + RUNS_TABLE_OPEN
+        + run_row(7, "accepted", "Fix the bug")
+        + RUNS_TABLE_CLOSE
+        + DOCUMENT_TAIL
+    )
+
+
+def test_render_runs_page_with_no_runs_is_exactly_the_planned_document(viewer):
+    assert render_runs(viewer, []) == RUNS_HEAD + NO_RUNS_LINE + DOCUMENT_TAIL
+
+
+def test_render_runs_page_with_unreadable_runs_is_exactly_the_planned_document(viewer):
+    page = viewer.render_runs_page(viewer.RunsPageData(viewer.UNREADABLE, ENDED_DT))
+    assert page == RUNS_HEAD + RUNS_UNAVAILABLE_LINE + DOCUMENT_TAIL
+
+
+def test_render_runs_page_has_its_own_title_and_heading(viewer):
+    page = render_runs(viewer, [ended_summary(viewer)])
+    assert page.startswith("<!doctype html>\n")
+    assert "<title>Runs - tomfactory viewer</title>" in page
+    assert "<h1>Runs</h1>\n" in page
+    assert "Hello from the factory" not in page
+    assert page.endswith(DOCUMENT_TAIL)
+
+
+def test_render_runs_page_takes_one_runs_page_data_and_no_other_argument(viewer):
+    data = viewer.RunsPageData((), ENDED_DT)
+    assert NO_RUNS_LINE in viewer.render_runs_page(data)
+    with pytest.raises(TypeError):
+        viewer.render_runs_page(data, ENDED_DT)
+    with pytest.raises(TypeError):
+        viewer.render_runs_page(data, now=ENDED_DT)
+
+
+def test_render_runs_page_called_twice_with_the_same_data_returns_the_same_page(viewer):
+    data = viewer.RunsPageData(
+        (running_summary(viewer, run_id=2), ended_summary(viewer, run_id=1)), ENDED_DT
+    )
+    assert viewer.render_runs_page(data) == viewer.render_runs_page(data)
+    assert 'id="run-2"' in viewer.render_runs_page(data)
+
+
+# ------------------------------------------------------- render_runs_page: the rows
+
+
+def test_render_runs_page_shows_the_exact_row_of_an_ended_run(viewer):
+    run = ended_summary(viewer, run_id=6, outcome="rejected", request="Tidy the docs")
+    page = render_runs(viewer, [run], read_at=ENDED_DT + timedelta(days=3))
+    assert run_row(6, "rejected", "Tidy the docs", CREATED_TEXT, "3m 7s") in page
+
+
+def test_render_runs_page_shows_the_exact_row_of_a_running_run_with_so_far(viewer):
+    run = running_summary(viewer, run_id=7, request="Add a page at /runs")
+    page = render_runs(viewer, [run], read_at=CREATED_DT + timedelta(seconds=187))
+    assert (
+        run_row(7, "working", "Add a page at /runs", CREATED_TEXT, "3m 7s so far")
+        in page
+    )
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "rejected", "needs-me"])
+def test_render_runs_page_shows_the_outcome_as_the_status_of_an_ended_run(
+    viewer, outcome
+):
+    page = render_runs(viewer, [ended_summary(viewer, outcome=outcome)])
+    assert f'<td class="run-status">{outcome}</td>' in page
+    assert '<td class="run-status">ended</td>' not in page
+
+
+@pytest.mark.parametrize("state", ["planning", "awaiting_approval", "working"])
+def test_render_runs_page_shows_the_state_as_the_status_of_a_run_that_has_not_ended(
+    viewer, state
+):
+    page = render_runs(viewer, [running_summary(viewer, state=state)])
+    assert f'<td class="run-status">{state}</td>' in page
+
+
+def test_render_runs_page_ended_row_does_not_depend_on_read_at(viewer):
+    runs = [ended_summary(viewer)]
+    early = render_runs(viewer, runs, read_at=ENDED_DT)
+    late = render_runs(viewer, runs, read_at=ENDED_DT + timedelta(days=30))
+    assert early == late
+    assert "so far" not in early
+
+
+def test_render_runs_page_running_duration_is_measured_to_read_at(viewer):
+    runs = [running_summary(viewer)]
+    early = render_runs(viewer, runs, read_at=CREATED_DT + timedelta(seconds=5))
+    late = render_runs(viewer, runs, read_at=CREATED_DT + timedelta(hours=2, seconds=7))
+    assert duration_cell("5s so far") in early
+    assert duration_cell("2h 0m 7s so far") in late
+
+
+def test_render_runs_page_keeps_rows_in_the_order_given(viewer):
+    runs = [
+        ended_summary(viewer, run_id=3),
+        ended_summary(viewer, run_id=9),
+        ended_summary(viewer, run_id=1),
+    ]
+    page = render_runs(viewer, runs)
+    assert re.findall(r'<tr id="run-(\d+)">', page) == ["3", "9", "1"]
+
+
+def test_render_runs_page_shows_one_row_per_run_inside_one_table(viewer):
+    runs = [running_summary(viewer, run_id=3)] + [
+        ended_summary(viewer, run_id=n) for n in (2, 1)
+    ]
+    page = render_runs(viewer, runs)
+    assert page.count("<table") == 1
+    assert page.count('<tr id="run-') == 3
+    assert page.count("so far") == 1
+    assert RUNS_TABLE_OPEN + run_row(3, "working", "Fix the bug", duration="3m 7s so far") in page
+    assert page.endswith(
+        run_row(1, "accepted", "Fix the bug") + RUNS_TABLE_CLOSE + DOCUMENT_TAIL
+    )
+
+
+def test_render_runs_page_shows_every_run_when_there_are_many(viewer):
+    runs = [ended_summary(viewer, run_id=n) for n in range(300, 0, -1)]
+    page = render_runs(viewer, runs)
+    assert page.count('<tr id="run-') == 300
+    assert 'id="run-300"' in page
+    assert 'id="run-1"' in page
+
+
+def test_render_runs_page_shows_a_table_and_no_message_when_there_are_runs(viewer):
+    page = render_runs(viewer, [ended_summary(viewer)])
+    assert '<table id="runs">' in page
+    assert "no-runs" not in page
+    assert "runs-unavailable" not in page
+
+
+# -------------------------------------------- render_runs_page: no runs, unreadable
+
+
+def test_render_runs_page_says_no_runs_recorded_yet_without_a_table(viewer):
+    page = render_runs(viewer, [])
+    assert NO_RUNS_LINE in page
+    assert "<table" not in page
+    assert "<tr" not in page
+    assert "runs-unavailable" not in page
+
+
+def test_render_runs_page_says_runs_unavailable_without_a_table(viewer):
+    page = viewer.render_runs_page(viewer.RunsPageData(viewer.UNREADABLE, ENDED_DT))
+    assert RUNS_UNAVAILABLE_LINE in page
+    assert "<table" not in page
+    assert "<tr" not in page
+    assert "no-runs" not in page
+
+
+def test_render_runs_page_differs_between_no_runs_and_unreadable_runs(viewer):
+    empty = render_runs(viewer, [])
+    unreadable = viewer.render_runs_page(
+        viewer.RunsPageData(viewer.UNREADABLE, ENDED_DT)
+    )
+    assert empty != unreadable
+    assert "No runs recorded yet" not in unreadable
+
+
+# ------------------------------------- render_runs_page: first words of the request
+
+
+def render_request(viewer, request):
+    return render_runs(viewer, [ended_summary(viewer, request=request)])
+
+
+def test_render_runs_page_shows_a_ten_word_request_in_full_without_an_ellipsis(viewer):
+    page = render_request(viewer, TEN_WORDS)
+    assert request_cell(TEN_WORDS) in page
+    assert "…" not in page
+
+
+def test_render_runs_page_cuts_an_eleven_word_request_to_ten_words_and_an_ellipsis(
+    viewer,
+):
+    page = render_request(viewer, TEN_WORDS + " eleven")
+    assert request_cell(TEN_WORDS + "…") in page
+    assert "eleven" not in page
+
+
+def test_render_runs_page_cuts_a_very_long_request_to_ten_words(viewer):
+    page = render_request(viewer, TEN_WORDS + " tail" * 5000)
+    assert request_cell(TEN_WORDS + "…") in page
+    assert "tail" not in page
+
+
+def test_render_runs_page_shows_a_nine_word_request_in_full(viewer):
+    nine = "one two three four five six seven eight nine"
+    page = render_request(viewer, nine)
+    assert request_cell(nine) in page
+    assert "…" not in page
+
+
+def test_render_runs_page_shows_a_one_word_request_in_full(viewer):
+    page = render_request(viewer, "Refactor")
+    assert request_cell("Refactor") in page
+    assert "…" not in page
+
+
+def test_render_runs_page_shows_a_long_single_word_in_full(viewer):
+    word = "x" * 500
+    page = render_request(viewer, word)
+    assert request_cell(word) in page
+    assert "…" not in page
+
+
+def test_render_runs_page_shows_an_empty_cell_for_an_empty_request(viewer):
+    page = render_request(viewer, "")
+    assert request_cell("") in page
+    assert "…" not in page
+
+
+def test_render_runs_page_shows_an_empty_cell_for_a_whitespace_only_request(viewer):
+    page = render_request(viewer, " \n\t  \n")
+    assert request_cell("") in page
+    assert "…" not in page
+
+
+def test_render_runs_page_collapses_newlines_and_tabs_in_the_request_to_spaces(viewer):
+    page = render_request(viewer, "Add a page\n\nat /runs\tlisting\r\nevery   run")
+    assert request_cell("Add a page at /runs listing every run") in page
+
+
+def test_render_runs_page_strips_whitespace_around_the_request(viewer):
+    page = render_request(viewer, "\n  Fix the bug  \n")
+    assert request_cell("Fix the bug") in page
+
+
+def test_render_runs_page_does_not_add_an_ellipsis_for_trailing_whitespace(viewer):
+    page = render_request(viewer, TEN_WORDS + "   \n\n")
+    assert request_cell(TEN_WORDS) in page
+    assert "…" not in page
+
+
+def test_render_runs_page_counts_words_across_lines(viewer):
+    request = "one two three\nfour five six\nseven eight nine\nten eleven twelve"
+    page = render_request(viewer, request)
+    assert request_cell(TEN_WORDS + "…") in page
+    assert "eleven" not in page
+
+
+def test_render_runs_page_keeps_punctuation_attached_to_the_tenth_word(viewer):
+    request = (
+        "Add a page at /runs listing every run, newest first: its id, its state"
+    )
+    page = render_request(viewer, request)
+    assert (
+        request_cell("Add a page at /runs listing every run, newest first:…") in page
+    )
+
+
+def test_render_runs_page_keeps_non_ascii_text_in_the_request(viewer):
+    page = render_request(viewer, "Ajouter un café ✓")
+    assert request_cell("Ajouter un café ✓") in page
+
+
+# ----------------------------------------------------- render_runs_page: escaping
+
+
+def test_render_runs_page_escapes_markup_in_the_request(viewer):
+    page = render_request(viewer, "<script>alert(1)</script> & more")
+    assert request_cell("&lt;script&gt;alert(1)&lt;/script&gt; &amp; more") in page
+    assert "<script>" not in page
+
+
+def test_render_runs_page_escapes_quotes_in_the_request(viewer):
+    request = "say \"hi\" to 'them'"
+    page = render_request(viewer, request)
+    assert request_cell(html.escape(request)) in page
+    assert 'say "hi"' not in page
+
+
+def test_render_runs_page_escapes_markup_in_a_shortened_request(viewer):
+    page = render_request(viewer, "<b>one</b> two three four five six seven eight nine & eleven")
+    assert (
+        request_cell(
+            "&lt;b&gt;one&lt;/b&gt; two three four five six seven eight nine &amp;…"
+        )
+        in page
+    )
+    assert "<b>" not in page
+
+
+def test_render_runs_page_escapes_markup_in_the_outcome(viewer):
+    page = render_runs(viewer, [ended_summary(viewer, outcome="<b>&")])
+    assert '<td class="run-status">&lt;b&gt;&amp;</td>' in page
+    assert "<b>" not in page
+
+
+def test_render_runs_page_escapes_markup_in_the_state(viewer):
+    state = '<i>"working"</i>'
+    page = render_runs(viewer, [running_summary(viewer, state=state)])
+    assert '<td class="run-status">' + html.escape(state) + "</td>" in page
+    assert "<i>" not in page
+
+
+# ------------------------------------------- render_runs_page: created and duration
+
+
+def test_render_runs_page_shows_created_in_utc(viewer):
+    created = datetime(2025, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    run = ended_summary(viewer, created_at=created, ended_at=created)
+    page = render_runs(viewer, [run])
+    assert '<td class="run-created">2025-01-02 03:04:05 UTC</td>' in page
+
+
+DURATIONS = [
+    pytest.param(0, "0s", id="zero"),
+    pytest.param(1, "1s", id="one_second"),
+    pytest.param(42, "42s", id="seconds_only"),
+    pytest.param(59, "59s", id="just_under_a_minute"),
+    pytest.param(60, "1m 0s", id="exactly_a_minute"),
+    pytest.param(187, "3m 7s", id="minutes_and_seconds"),
+    pytest.param(3599, "59m 59s", id="just_under_an_hour"),
+    pytest.param(3600, "1h 0m 0s", id="exactly_an_hour"),
+    pytest.param(7207, "2h 0m 7s", id="hours_with_zero_minutes"),
+    pytest.param(86399, "23h 59m 59s", id="just_under_a_day"),
+    pytest.param(86400, "1d 0h 0m 0s", id="exactly_a_day"),
+    pytest.param(86400 + 187, "1d 0h 3m 7s", id="a_day_with_zero_hours"),
+    pytest.param(40 * 86400 + 3661, "40d 1h 1m 1s", id="many_days"),
+]
+
+
+@pytest.mark.parametrize("seconds, text", DURATIONS)
+def test_render_runs_page_formats_the_duration_of_an_ended_run_lasting(
+    viewer, seconds, text
+):
+    run = ended_summary(viewer, ended_at=CREATED_DT + timedelta(seconds=seconds))
+    page = render_runs(viewer, [run])
+    assert duration_cell(text) in page
+
+
+@pytest.mark.parametrize("seconds, text", DURATIONS)
+def test_render_runs_page_formats_the_duration_so_far_of_a_run_running_for(
+    viewer, seconds, text
+):
+    page = render_runs(
+        viewer,
+        [running_summary(viewer)],
+        read_at=CREATED_DT + timedelta(seconds=seconds),
+    )
+    assert duration_cell(text + " so far") in page
+
+
+def test_render_runs_page_shows_the_duration_in_whole_seconds(viewer):
+    page = render_runs(
+        viewer,
+        [running_summary(viewer)],
+        read_at=CREATED_DT + timedelta(seconds=187, microseconds=400000),
+    )
+    assert duration_cell("3m 7s so far") in page
+
+
+def test_render_runs_page_shows_unknown_created_and_duration_without_created_at(
+    viewer,
+):
+    page = render_runs(viewer, [ended_summary(viewer, created_at=None)])
+    assert run_row(7, "accepted", "Fix the bug", "unknown", "unknown") in page
+
+
+def test_render_runs_page_shows_unknown_duration_for_an_ended_run_without_ended_at(
+    viewer,
+):
+    page = render_runs(
+        viewer,
+        [ended_summary(viewer, ended_at=None)],
+        read_at=ENDED_DT + timedelta(days=2),
+    )
+    assert run_row(7, "accepted", "Fix the bug", CREATED_TEXT, "unknown") in page
+    assert "so far" not in page
+
+
+def test_render_runs_page_does_not_say_so_far_when_a_running_duration_is_unknown(
+    viewer,
+):
+    page = render_runs(viewer, [running_summary(viewer, created_at=None)])
+    assert run_row(7, "working", "Fix the bug", "unknown", "unknown") in page
+    assert "so far" not in page
+
+
+def test_render_runs_page_shows_zero_seconds_for_a_run_that_ended_before_it_began(
+    viewer,
+):
+    run = ended_summary(viewer, ended_at=CREATED_DT - timedelta(minutes=5))
+    page = render_runs(viewer, [run])
+    assert duration_cell("0s") in page
+    assert 'run-duration">-' not in page
+
+
+def test_render_runs_page_shows_zero_seconds_so_far_when_read_before_the_run_began(
+    viewer,
+):
+    page = render_runs(
+        viewer, [running_summary(viewer)], read_at=CREATED_DT - timedelta(minutes=5)
+    )
+    assert duration_cell("0s so far") in page
+
+
+# --------------------------------- render_runs_page does not read database or clock
+
+
+def test_render_runs_page_does_not_open_the_database_or_look_up_its_path(
+    viewer, home, monkeypatch
+):
+    make_runs_db(home, [{"request": "from the database"}])
+
+    def forbidden_connect(*args, **kwargs):
+        raise AssertionError("render_runs_page must not open the database")
+
+    def forbidden_db_path():
+        raise AssertionError("render_runs_page must not look up the database path")
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", forbidden_connect)
+    monkeypatch.setattr(viewer, "db_path", forbidden_db_path)
+
+    page = render_runs(viewer, [ended_summary(viewer, request="given by the caller")])
+    assert request_cell("given by the caller") in page
+    assert "from the database" not in page
+
+    assert NO_RUNS_LINE in render_runs(viewer, [])
+    assert RUNS_UNAVAILABLE_LINE in viewer.render_runs_page(
+        viewer.RunsPageData(viewer.UNREADABLE, ENDED_DT)
+    )
+
+
+def test_render_runs_page_with_no_runs_ignores_runs_in_the_database(viewer, home):
+    make_runs_db(home, [{"request": "from the database"}])
+    page = render_runs(viewer, [])
+    assert NO_RUNS_LINE in page
+    assert "from the database" not in page
+
+
+def test_render_runs_page_uses_read_at_and_not_the_current_time(viewer):
+    long_ago = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    run = running_summary(viewer, created_at=long_ago)
+    page = render_runs(viewer, [run], read_at=long_ago + timedelta(seconds=42))
+    assert duration_cell("42s so far") in page
+
+
+# -------------------------------------------------- render_page: the link to /runs
+
+
+def test_render_page_links_to_all_runs_between_the_heading_and_the_count_line(
+    viewer, home
+):
+    page = viewer.render_page(viewer.PageData(3, None))
+    assert (
+        "<h1>Hello from the factory</h1>\n" + RUNS_LINK_LINE + COUNT_LINE.format(3)
+        in page
+    )
+
+
+def test_render_page_links_to_all_runs_when_the_count_is_unreadable(viewer, home):
+    page = viewer.render_page(viewer.PageData(viewer.UNREADABLE, viewer.UNREADABLE))
+    assert (
+        "<h1>Hello from the factory</h1>\n"
+        + RUNS_LINK_LINE
+        + count_unavailable_line(home / "factory.db")
+        in page
+    )
+
+
+def test_render_page_links_to_all_runs_exactly_once(viewer, home):
+    page = viewer.render_page(
+        viewer.PageData(3, viewer.LatestRun("accepted", "all green"))
+    )
+    assert page.count('id="runs-link"') == 1
+    assert page.count('href="/runs"') == 1
+
+
+def test_render_page_is_otherwise_the_same_document_as_before(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, None))
+    assert page == (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        "<title>tomfactory viewer</title>\n"
+        "</head>\n"
+        "<body>\n"
+        "<h1>Hello from the factory</h1>\n"
+        + RUNS_LINK_LINE
+        + COUNT_LINE.format(3)
+        + DOCUMENT_TAIL
+    )
+
+
+# ------------------------------------------------------------- HTTP server, /runs
+
+
+def test_get_runs_returns_200_html_in_utf8(home, port):
+    make_runs_db(home, [{}])
+    status, headers, body = fetch(port, "/runs")
+    assert status == 200
+    assert headers["Content-Type"].replace(" ", "").lower() == "text/html;charset=utf-8"
+    assert "<h1>Runs</h1>" in body.decode("utf-8")
+
+
+def test_get_runs_content_length_matches_body(home, port):
+    make_runs_db(home, [{}])
+    status, headers, body = fetch(port, "/runs")
+    assert status == 200
+    assert headers["Content-Length"] is not None
+    assert int(headers["Content-Length"]) == len(body)
+    assert len(body) > 0
+
+
+def test_get_runs_content_length_matches_body_with_non_ascii_text(home, port):
+    make_runs_db(home, [{"request": "café ✓ " + TEN_WORDS + " eleven"}])
+    status, headers, body = fetch(port, "/runs")
+    assert status == 200
+    assert "café ✓ one two three four five six seven eight…" in body.decode("utf-8")
+    assert int(headers["Content-Length"]) == len(body)
+    assert len(body) > len(body.decode("utf-8"))
+
+
+def test_get_runs_shows_the_row_of_the_one_run(home, port):
+    make_runs_db(home, [{"run_id": 7, "request": "Add a page at /runs"}])
+    status, _, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert run_row(7, "accepted", "Add a page at /runs", CREATED_TEXT, "3m 7s") in text
+    assert text.count('<tr id="run-') == 1
+
+
+def test_get_runs_body_is_the_runs_page_rendered_from_the_runs_page_data(
+    viewer, home, port
+):
+    # Every run here has ended, so the page does not depend on when it was read.
+    make_runs_db(home, [{"request": "first"}, {"outcome": "rejected"}])
+    status, _, body = fetch(port, "/runs")
+    assert status == 200
+    assert body.decode("utf-8") == viewer.render_runs_page(viewer.read_runs_page_data())
+    assert b'<table id="runs">' in body
+
+
+def test_get_runs_lists_runs_newest_first(home, port):
+    make_runs_db(home, [{"run_id": 5}, {"run_id": 12}, {"run_id": 9}])
+    _, _, body = fetch(port, "/runs")
+    assert re.findall(r'<tr id="run-(\d+)">', body.decode("utf-8")) == ["12", "9", "5"]
+
+
+def test_get_runs_shows_a_running_run_with_its_state_and_duration_so_far(home, port):
+    make_runs_db(
+        home,
+        [{}, {"request": "Still going", "created_at": "2020-01-01T00:00:00Z", **RUNNING}],
+    )
+    status, _, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert re.search(
+        r'<tr id="run-2"><td class="run-id">2</td>'
+        r'<td class="run-status">working</td>'
+        r'<td class="run-request">Still going</td>'
+        r'<td class="run-created">2020-01-01 00:00:00 UTC</td>'
+        r'<td class="run-duration">\d+d \d+h \d+m \d+s so far</td></tr>\n',
+        text,
+    )
+    assert run_row(1, "accepted", "Fix the bug") in text
+    assert text.count("so far") == 1
+
+
+def test_get_runs_escapes_markup_in_the_request(home, port):
+    make_runs_db(home, [{"request": "<script>alert(1)</script> & more"}])
+    _, _, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert request_cell("&lt;script&gt;alert(1)&lt;/script&gt; &amp; more") in text
+    assert "<script>" not in text
+
+
+def test_get_runs_ignores_the_query_string(home, port):
+    make_runs_db(home, [{"run_id": 7}])
+    status, _, body = fetch(port, "/runs?x=1")
+    assert status == 200
+    assert 'id="run-7"' in body.decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "path", ["/runs/", "/runs/7", "/runs.html", "/run", "/Runs", "/runs/?x=1"]
+)
+def test_get_runs_is_served_only_at_exactly_runs_not_at(home, port, path):
+    make_runs_db(home, [{"run_id": 7}])
+    assert fetch(port, "/runs")[0] == 200
+    status, _, body = fetch(port, path)
+    assert status == 404
+    assert b'id="run-7"' not in body
+
+
+def test_get_runs_with_a_trailing_slash_does_not_open_the_database(
+    viewer, home, port, monkeypatch
+):
+    make_runs_db(home, [{}])
+    calls = record_connects(viewer, monkeypatch)
+
+    assert fetch(port, "/runs/")[0] == 404
+    assert calls == []
+
+    assert fetch(port, "/runs")[0] == 200
+    assert_one_read_only_connect(calls)
+
+
+def test_get_runs_opens_one_read_only_connection_per_request(
+    viewer, home, port, monkeypatch
+):
+    make_runs_db(home, [{}, {}])
+    calls = record_connects(viewer, monkeypatch)
+
+    status, _, body = fetch(port, "/runs")
+
+    assert status == 200
+    assert body.decode("utf-8").count('<tr id="run-') == 2
+    assert_one_read_only_connect(calls)
+
+
+def test_get_runs_shows_a_run_inserted_between_two_requests(home, port):
+    path = make_runs_db(home, [{}])
+    _, _, first = fetch(port, "/runs")
+    assert 'id="run-1"' in first.decode("utf-8")
+    assert 'id="run-2"' not in first.decode("utf-8")
+
+    insert_full_run(path, request="A newer run", **RUNNING)
+
+    status, _, second = fetch(port, "/runs")
+    text = second.decode("utf-8")
+    assert status == 200
+    assert re.findall(r'<tr id="run-(\d+)">', text) == ["2", "1"]
+    assert request_cell("A newer run") in text
+
+
+def test_get_runs_shows_the_outcome_once_a_running_run_has_ended(home, port):
+    path = make_runs_db(home, [RUNNING])
+    _, _, first = fetch(port, "/runs")
+    assert '<td class="run-status">working</td>' in first.decode("utf-8")
+
+    execute_sql(
+        path,
+        "UPDATE runs SET state = 'ended', outcome = 'needs-me', ended_at = ?",
+        (ENDED,),
+    )
+
+    _, _, second = fetch(port, "/runs")
+    text = second.decode("utf-8")
+    assert run_row(1, "needs-me", "Fix the bug", CREATED_TEXT, "3m 7s") in text
+    assert "so far" not in text
+
+
+def test_get_runs_twice_returns_the_same_page_when_every_run_has_ended(home, port):
+    make_runs_db(home, [{}, {}])
+    first = fetch(port, "/runs")
+    second = fetch(port, "/runs")
+    assert first[0] == second[0] == 200
+    assert first[2] == second[2]
+    assert b'<table id="runs">' in first[2]
+
+
+def test_get_runs_with_an_empty_runs_table_says_no_runs_recorded_yet(
+    viewer, home, port
+):
+    make_runs_db(home)
+    status, _, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert text == RUNS_HEAD + NO_RUNS_LINE + DOCUMENT_TAIL
+
+
+def test_get_runs_without_database_returns_200_with_runs_unavailable(home, port):
+    status, headers, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert text == RUNS_HEAD + RUNS_UNAVAILABLE_LINE + DOCUMENT_TAIL
+    assert int(headers["Content-Length"]) == len(body)
+
+
+def test_get_runs_without_database_does_not_create_it(home, port):
+    status, _, body = fetch(port, "/runs")
+    assert status == 200
+    assert RUNS_UNAVAILABLE_LINE in body.decode("utf-8")
+    assert not (home / "factory.db").exists()
+    assert list(home.iterdir()) == []
+
+
+@pytest.mark.parametrize("break_database", UNREADABLE_RUNS_DATABASES)
+def test_get_runs_returns_200_with_runs_unavailable_when(home, port, break_database):
+    break_database(home)
+    status, _, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert RUNS_UNAVAILABLE_LINE in text
+    assert "<table" not in text
+    assert "no-runs" not in text
+
+
+def test_get_runs_recovers_once_the_database_appears(home, port):
+    _, _, before = fetch(port, "/runs")
+    assert RUNS_UNAVAILABLE_LINE in before.decode("utf-8")
+
+    make_runs_db(home, [{}])
+
+    _, _, after = fetch(port, "/runs")
+    text = after.decode("utf-8")
+    assert run_row(1, "accepted", "Fix the bug") in text
+    assert "unavailable" not in text
+
+
+def test_get_runs_leaves_the_database_file_unchanged(home, port):
+    path = make_runs_db(home, [{}, RUNNING])
+    before = path.read_bytes()
+    status, _, body = fetch(port, "/runs")
+    assert status == 200
+    assert body.decode("utf-8").count('<tr id="run-') == 2
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_get_runs_does_not_show_the_home_page(home, port):
+    make_runs_db(home, [{}])
+    status, _, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert "<title>Runs - tomfactory viewer</title>" in text
+    assert "Hello from the factory" not in text
+    assert "run-count" not in text
+
+
+def test_server_still_serves_runs_after_a_404_and_after_the_home_page(home, port):
+    make_runs_db(home, [{}])
+    assert fetch(port, "/nope")[0] == 404
+    assert fetch(port, "/")[0] == 200
+    status, _, body = fetch(port, "/runs")
+    assert status == 200
+    assert b'id="run-1"' in body
+
+
+# --------------------------------------------- HTTP server, the link from the home page
+
+
+def test_get_root_links_to_the_runs_page(home, port):
+    make_runs_db(home, [{}])
+    status, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert status == 200
+    assert 'href="/runs"' in text
+    assert "<h1>Hello from the factory</h1>\n" + RUNS_LINK_LINE + COUNT_LINE.format(1) in text
+
+
+def test_get_root_links_to_the_runs_page_when_there_is_no_database(home, port):
+    status, _, body = fetch(port)
+    assert status == 200
+    assert RUNS_LINK_LINE in body.decode("utf-8")
+
+
+def test_the_runs_link_on_the_home_page_leads_to_the_runs_page(home, port):
+    make_runs_db(home, [{"run_id": 7}])
+    _, _, home_body = fetch(port)
+    match = re.search(r'<a id="runs-link" href="([^"]+)">', home_body.decode("utf-8"))
+    assert match is not None
+    status, _, runs_body = fetch(port, match.group(1))
+    assert status == 200
+    assert 'id="run-7"' in runs_body.decode("utf-8")
