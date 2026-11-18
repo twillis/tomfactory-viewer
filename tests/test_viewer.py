@@ -15,9 +15,29 @@ import pytest
 
 # --------------------------------------------------------------------------- helpers
 
+OUTCOME_LINE = '<p>Latest run outcome: <strong id="latest-run-outcome">{}</strong></p>\n'
+REASON_LINE = '<p>Latest run reason: <span id="latest-run-reason">{}</span></p>\n'
+NOT_ENDED_LINE = '<p id="latest-run-not-ended">Latest run has not ended yet</p>\n'
+LATEST_UNAVAILABLE_LINE = (
+    '<p id="latest-run-unavailable">Latest run unavailable: '
+    "could not read outcome and reason from the runs table</p>\n"
+)
+COUNT_LINE = '<p>Runs recorded: <strong id="run-count">{}</strong></p>\n'
+
+
+def count_unavailable_line(path):
+    """The line the page shows when the count could not be read from ``path``."""
+    return (
+        '<p id="run-count-unavailable">Run count unavailable: '
+        f"no readable runs table in {html.escape(str(path))}</p>\n"
+    )
+
 
 def make_db(home, rows=0, with_runs_table=True):
-    """Create ``home/factory.db``; optionally with a ``runs`` table holding ``rows`` rows."""
+    """Create ``home/factory.db``; optionally with a ``runs`` table holding ``rows`` rows.
+
+    The ``runs`` table made here has no ``outcome`` or ``reason`` column.
+    """
     home.mkdir(parents=True, exist_ok=True)
     path = home / "factory.db"
     conn = sqlite3.connect(path)
@@ -42,6 +62,42 @@ def insert_run(path):
         conn.close()
 
 
+def make_outcome_db(home, runs=()):
+    """Create ``home/factory.db`` whose ``runs`` table has outcome and reason columns.
+
+    ``runs`` is a sequence of ``(outcome, reason)`` pairs, inserted in order.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "factory.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY, outcome TEXT, reason TEXT)"
+        )
+        conn.executemany("INSERT INTO runs (outcome, reason) VALUES (?, ?)", list(runs))
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def execute_sql(path, sql, params=()):
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_outcome_run(path, outcome, reason, run_id=None):
+    execute_sql(
+        path,
+        "INSERT INTO runs (id, outcome, reason) VALUES (?, ?, ?)",
+        (run_id, outcome, reason),
+    )
+
+
 def fetch(port, path="/", method="GET"):
     """Return ``(status, headers, body_bytes)`` for a request to the test server."""
     request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
@@ -53,6 +109,102 @@ def fetch(port, path="/", method="GET"):
             return error.code, error.headers, error.read()
         finally:
             error.close()
+
+
+def record_connects(viewer, monkeypatch):
+    """Replace ``viewer.sqlite3.connect`` with a recorder; return the list of calls.
+
+    ``viewer.sqlite3`` is the ``sqlite3`` module itself, so build the database before
+    calling this: every later ``sqlite3.connect`` call is recorded.
+    """
+    calls = []
+    real_connect = sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", recording_connect)
+    return calls
+
+
+def assert_one_read_only_connect(calls):
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    database = args[0] if args else kwargs["database"]
+    assert "mode=ro" in str(database)
+    assert kwargs.get("uri") is True
+
+
+class ConnectionProxy:
+    """Stands in for the connection the viewer opens.
+
+    It offers only ``execute`` and ``close``, which is all the data layer is meant to
+    use on its connection. ``after_execute(sql)`` runs right after each statement.
+    """
+
+    def __init__(self, real, after_execute=None):
+        self._real = real
+        self._after_execute = after_execute
+        self.statements = []
+        self.close_calls = 0
+
+    def execute(self, sql, *args, **kwargs):
+        cursor = self._real.execute(sql, *args, **kwargs)
+        self.statements.append(sql)
+        if self._after_execute is not None:
+            self._after_execute(sql)
+        return cursor
+
+    def close(self):
+        self.close_calls += 1
+        self._real.close()
+
+
+def wrap_connections(viewer, monkeypatch, after_execute=None):
+    """Make ``viewer.sqlite3.connect`` return proxies; return the list of proxies made."""
+    proxies = []
+    real_connect = sqlite3.connect
+
+    def wrapping_connect(*args, **kwargs):
+        proxy = ConnectionProxy(real_connect(*args, **kwargs), after_execute)
+        proxies.append(proxy)
+        return proxy
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", wrapping_connect)
+    return proxies
+
+
+# Ways for the whole database to be unreadable. Each takes the home directory.
+
+
+def _leave_database_missing(home):
+    pass
+
+
+def _write_empty_file(home):
+    (home / "factory.db").write_bytes(b"")
+
+
+def _write_non_sqlite_file(home):
+    (home / "factory.db").write_bytes(b"this is definitely not a sqlite database\n" * 50)
+
+
+def _make_factory_db_a_directory(home):
+    (home / "factory.db").mkdir()
+
+
+def _make_database_without_runs_table(home):
+    make_db(home, with_runs_table=False)
+
+
+UNREADABLE_DATABASES = [
+    pytest.param(_leave_database_missing, id="database_file_is_missing"),
+    pytest.param(_write_empty_file, id="database_file_is_empty"),
+    pytest.param(_write_non_sqlite_file, id="file_is_not_a_sqlite_database"),
+    pytest.param(_make_factory_db_a_directory, id="factory_db_is_a_directory"),
+    pytest.param(_make_database_without_runs_table, id="runs_table_is_missing"),
+]
 
 
 # -------------------------------------------------------------------------- fixtures
@@ -121,167 +273,955 @@ def test_db_path_reads_the_environment_on_every_call(viewer, tmp_path, monkeypat
     assert viewer.db_path() == second / "factory.db"
 
 
-# ------------------------------------------------------------------------ count_runs
+# --------------------------------------------------- the removed one-fact-per-call API
 
 
-def test_count_runs_returns_number_of_rows(viewer, home):
-    make_db(home, rows=3)
-    assert viewer.count_runs() == 3
+@pytest.mark.parametrize("name", ["count_runs", "latest_run", "_fetch_one"])
+def test_viewer_no_longer_has_the_one_connection_per_fact_readers(viewer, name):
+    assert not hasattr(viewer, name)
 
 
-def test_count_runs_returns_zero_for_empty_runs_table(viewer, home):
-    make_db(home, rows=0)
-    count = viewer.count_runs()
+# ---------------------------------------------------------- UNREADABLE and PageData
+
+
+def test_unreadable_is_the_single_member_of_the_unreadable_enum(viewer):
+    assert viewer.UNREADABLE is viewer.Unreadable.UNREADABLE
+    assert list(viewer.Unreadable) == [viewer.UNREADABLE]
+    assert isinstance(viewer.UNREADABLE, viewer.Unreadable)
+
+
+def test_unreadable_is_not_none_and_not_equal_to_a_count_or_a_run(viewer):
+    assert viewer.UNREADABLE is not None
+    assert viewer.UNREADABLE != 0
+    assert viewer.UNREADABLE != ""
+    assert viewer.UNREADABLE != viewer.LatestRun("", "")
+
+
+def test_page_data_has_count_and_latest_fields_in_that_order(viewer):
+    data = viewer.PageData(3, viewer.LatestRun("passed", "all green"))
+    assert viewer.PageData._fields == ("count", "latest")
+    assert data.count == 3
+    assert data.latest == viewer.LatestRun("passed", "all green")
+
+
+def test_page_data_accepts_its_fields_by_keyword(viewer):
+    assert viewer.PageData(count=0, latest=None) == viewer.PageData(0, None)
+
+
+def test_page_data_requires_latest_to_be_given(viewer):
+    page_data = viewer.PageData
+    with pytest.raises(TypeError):
+        page_data(3)
+
+
+def test_page_data_requires_count_to_be_given(viewer):
+    page_data = viewer.PageData
+    with pytest.raises(TypeError):
+        page_data(latest=None)
+
+
+# --------------------------------------------------- read_page_data: readable states
+
+
+def test_read_page_data_returns_a_page_data(viewer, home):
+    make_outcome_db(home, [("passed", "all green")])
+    assert isinstance(viewer.read_page_data(), viewer.PageData)
+
+
+def test_read_page_data_returns_count_and_latest_run_of_a_single_ended_run(viewer, home):
+    make_outcome_db(home, [("passed", "all green")])
+    assert viewer.read_page_data() == viewer.PageData(
+        1, viewer.LatestRun("passed", "all green")
+    )
+
+
+def test_read_page_data_latest_is_a_latest_run_with_outcome_and_reason(viewer, home):
+    make_outcome_db(home, [("failed", "tests red")])
+    latest = viewer.read_page_data().latest
+    assert isinstance(latest, viewer.LatestRun)
+    assert latest.outcome == "failed"
+    assert latest.reason == "tests red"
+
+
+def test_read_page_data_counts_every_row_and_returns_the_row_with_the_highest_id(
+    viewer, home
+):
+    make_outcome_db(
+        home, [("passed", "first"), ("failed", "second"), ("passed", "third")]
+    )
+    assert viewer.read_page_data() == viewer.PageData(
+        3, viewer.LatestRun("passed", "third")
+    )
+
+
+def test_read_page_data_latest_uses_highest_id_not_insertion_order(viewer, home):
+    path = make_outcome_db(home)
+    insert_outcome_run(path, "failed", "newest by id", run_id=50)
+    insert_outcome_run(path, "passed", "inserted last", run_id=7)
+    assert viewer.read_page_data() == viewer.PageData(
+        2, viewer.LatestRun("failed", "newest by id")
+    )
+
+
+def test_read_page_data_count_is_the_number_of_rows_not_the_highest_id(viewer, home):
+    path = make_outcome_db(home)
+    insert_outcome_run(path, "passed", "all green", run_id=50)
+    assert viewer.read_page_data().count == 1
+
+
+def test_read_page_data_latest_is_the_not_ended_row_when_older_rows_have_ended(
+    viewer, home
+):
+    make_outcome_db(home, [("passed", "all green"), ("failed", "boom"), (None, None)])
+    assert viewer.read_page_data() == viewer.PageData(3, viewer.LatestRun("", ""))
+
+
+def test_read_page_data_latest_ignores_older_not_ended_rows(viewer, home):
+    make_outcome_db(home, [(None, None), ("", ""), ("passed", "all green")])
+    assert viewer.read_page_data() == viewer.PageData(
+        3, viewer.LatestRun("passed", "all green")
+    )
+
+
+def test_read_page_data_latest_has_empty_strings_for_null_columns(viewer, home):
+    make_outcome_db(home, [(None, None)])
+    data = viewer.read_page_data()
+    assert data.latest is not None
+    assert data.latest is not viewer.UNREADABLE
+    assert data == viewer.PageData(1, viewer.LatestRun("", ""))
+    assert data.latest.outcome == ""
+    assert data.latest.reason == ""
+
+
+def test_read_page_data_latest_has_empty_strings_for_empty_string_columns(viewer, home):
+    make_outcome_db(home, [("", "")])
+    data = viewer.read_page_data()
+    assert data.latest is not None
+    assert data.latest is not viewer.UNREADABLE
+    assert data == viewer.PageData(1, viewer.LatestRun("", ""))
+
+
+def test_read_page_data_latest_has_empty_reason_when_ended_run_has_null_reason(
+    viewer, home
+):
+    make_outcome_db(home, [("passed", None)])
+    assert viewer.read_page_data().latest == viewer.LatestRun("passed", "")
+
+
+def test_read_page_data_latest_keeps_reason_when_outcome_is_null(viewer, home):
+    make_outcome_db(home, [(None, "still going")])
+    assert viewer.read_page_data().latest == viewer.LatestRun("", "still going")
+
+
+def test_read_page_data_returns_text_unchanged_including_markup_and_unicode(
+    viewer, home
+):
+    make_outcome_db(home, [("<b>&", "café ✓ 'quoted'")])
+    assert viewer.read_page_data().latest == viewer.LatestRun(
+        "<b>&", "café ✓ 'quoted'"
+    )
+
+
+def test_read_page_data_count_is_an_int_when_readable(viewer, home):
+    make_outcome_db(home, [("passed", "a"), (None, None)])
+    count = viewer.read_page_data().count
+    assert type(count) is int
+    assert count == 2
+
+
+def test_read_page_data_works_when_home_path_contains_a_space(
+    viewer, tmp_path, monkeypatch
+):
+    spaced = tmp_path / "factory home"
+    make_outcome_db(spaced, [("passed", "all green"), ("failed", "tests red")])
+    monkeypatch.setenv("TOMFACTORY_HOME", str(spaced))
+    assert viewer.read_page_data() == viewer.PageData(
+        2, viewer.LatestRun("failed", "tests red")
+    )
+
+
+# ------------------------------------------------- read_page_data: empty runs table
+
+
+def test_read_page_data_returns_zero_and_none_for_an_empty_runs_table(viewer, home):
+    make_outcome_db(home, [])
+    assert viewer.read_page_data() == viewer.PageData(0, None)
+
+
+def test_read_page_data_count_is_an_int_zero_for_an_empty_runs_table(viewer, home):
+    make_outcome_db(home, [])
+    count = viewer.read_page_data().count
+    assert type(count) is int
     assert count == 0
-    assert count is not None
+    assert count is not viewer.UNREADABLE
 
 
-def test_count_runs_counts_a_single_row(viewer, home):
-    make_db(home, rows=1)
-    assert viewer.count_runs() == 1
+def test_read_page_data_latest_is_none_not_unreadable_for_an_empty_runs_table(
+    viewer, home
+):
+    make_outcome_db(home, [])
+    latest = viewer.read_page_data().latest
+    assert latest is None
+    assert latest is not viewer.UNREADABLE
 
 
-def test_count_runs_returns_an_int(viewer, home):
-    make_db(home, rows=2)
-    assert type(viewer.count_runs()) is int
+# ----------------------------------------- read_page_data: outcome columns unreadable
 
 
-def test_count_runs_sees_rows_added_between_calls(viewer, home):
-    path = make_db(home, rows=3)
-    assert viewer.count_runs() == 3
-    insert_run(path)
-    assert viewer.count_runs() == 4
+def test_read_page_data_keeps_the_count_when_runs_has_no_outcome_or_reason_columns(
+    viewer, home
+):
+    make_db(home, rows=3)
+    assert viewer.read_page_data() == viewer.PageData(3, viewer.UNREADABLE)
 
 
-def test_count_runs_returns_none_when_database_file_is_missing(viewer, home):
-    assert viewer.count_runs() is None
+def test_read_page_data_latest_is_unreadable_not_none_when_columns_are_missing(
+    viewer, home
+):
+    make_db(home, rows=3)
+    latest = viewer.read_page_data().latest
+    assert latest is viewer.UNREADABLE
+    assert latest is not None
 
 
-def test_count_runs_does_not_create_missing_database_file(viewer, home):
-    viewer.count_runs()
-    assert not (home / "factory.db").exists()
-    assert list(home.iterdir()) == []
+def test_read_page_data_count_is_an_int_when_only_the_latest_run_is_unreadable(
+    viewer, home
+):
+    make_db(home, rows=3)
+    count = viewer.read_page_data().count
+    assert type(count) is int
+    assert count == 3
 
 
-def test_count_runs_returns_none_and_does_not_create_missing_home_directory(
+def test_read_page_data_latest_is_unreadable_when_runs_has_outcome_but_no_reason(
+    viewer, home
+):
+    path = make_db(home, with_runs_table=False)
+    execute_sql(path, "CREATE TABLE runs (id INTEGER PRIMARY KEY, outcome TEXT)")
+    execute_sql(path, "INSERT INTO runs (outcome) VALUES ('passed')")
+    assert viewer.read_page_data() == viewer.PageData(1, viewer.UNREADABLE)
+
+
+def test_read_page_data_latest_is_unreadable_when_runs_has_reason_but_no_outcome(
+    viewer, home
+):
+    path = make_db(home, with_runs_table=False)
+    execute_sql(path, "CREATE TABLE runs (id INTEGER PRIMARY KEY, reason TEXT)")
+    execute_sql(path, "INSERT INTO runs (reason) VALUES ('all green')")
+    assert viewer.read_page_data() == viewer.PageData(1, viewer.UNREADABLE)
+
+
+def test_read_page_data_latest_is_unreadable_for_an_empty_table_without_the_columns(
+    viewer, home
+):
+    # No rows and no columns: "could not read" wins over "no runs" for the latest run,
+    # while the count is still a readable zero.
+    make_db(home, rows=0)
+    data = viewer.read_page_data()
+    assert data == viewer.PageData(0, viewer.UNREADABLE)
+    assert data.latest is not None
+
+
+# ------------------------------------------------ read_page_data: database unreadable
+
+
+@pytest.mark.parametrize("break_database", UNREADABLE_DATABASES)
+def test_read_page_data_marks_both_facts_unreadable_when(viewer, home, break_database):
+    break_database(home)
+    data = viewer.read_page_data()
+    assert data == viewer.PageData(viewer.UNREADABLE, viewer.UNREADABLE)
+    assert data.count is viewer.UNREADABLE
+    assert data.latest is viewer.UNREADABLE
+
+
+@pytest.mark.parametrize("break_database", UNREADABLE_DATABASES)
+def test_read_page_data_never_reports_no_runs_when(viewer, home, break_database):
+    break_database(home)
+    data = viewer.read_page_data()
+    assert data.count is not None
+    assert data.count != 0
+    assert data.latest is not None
+
+
+def test_read_page_data_marks_both_facts_unreadable_when_home_directory_is_missing(
     viewer, tmp_path, monkeypatch
 ):
     missing = tmp_path / "does-not-exist"
     monkeypatch.setenv("TOMFACTORY_HOME", str(missing))
-    assert viewer.count_runs() is None
-    assert not missing.exists()
+    assert viewer.read_page_data() == viewer.PageData(
+        viewer.UNREADABLE, viewer.UNREADABLE
+    )
 
 
-def test_count_runs_returns_none_when_runs_table_is_missing(viewer, home):
-    make_db(home, with_runs_table=False)
-    assert viewer.count_runs() is None
+def test_read_page_data_marks_both_facts_unreadable_when_connect_raises(
+    viewer, home, monkeypatch
+):
+    make_outcome_db(home, [("passed", "all green")])
+
+    def failing_connect(*args, **kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", failing_connect)
+    assert viewer.read_page_data() == viewer.PageData(
+        viewer.UNREADABLE, viewer.UNREADABLE
+    )
 
 
-def test_count_runs_returns_none_when_database_file_is_empty(viewer, home):
-    (home / "factory.db").write_bytes(b"")
-    assert viewer.count_runs() is None
+# ------------------------------------------- read_page_data: one read-only connection
 
 
-def test_count_runs_returns_none_when_file_is_not_a_sqlite_database(viewer, home):
-    (home / "factory.db").write_bytes(b"this is definitely not a sqlite database\n" * 50)
-    assert viewer.count_runs() is None
+def test_read_page_data_opens_one_read_only_connection_for_count_and_latest_run(
+    viewer, home, monkeypatch
+):
+    make_outcome_db(home, [("passed", "all green"), ("failed", "tests red")])
+    calls = record_connects(viewer, monkeypatch)
+
+    assert viewer.read_page_data() == viewer.PageData(
+        2, viewer.LatestRun("failed", "tests red")
+    )
+    assert_one_read_only_connect(calls)
 
 
-def test_count_runs_returns_none_when_factory_db_is_a_directory(viewer, home):
-    (home / "factory.db").mkdir()
-    assert viewer.count_runs() is None
+def test_read_page_data_opens_one_read_only_connection_for_an_empty_runs_table(
+    viewer, home, monkeypatch
+):
+    make_outcome_db(home, [])
+    calls = record_connects(viewer, monkeypatch)
+
+    assert viewer.read_page_data() == viewer.PageData(0, None)
+    assert_one_read_only_connect(calls)
 
 
-def test_count_runs_works_when_home_path_contains_a_space(viewer, tmp_path, monkeypatch):
-    spaced = tmp_path / "factory home"
-    make_db(spaced, rows=2)
-    monkeypatch.setenv("TOMFACTORY_HOME", str(spaced))
-    assert viewer.count_runs() == 2
-
-
-def test_count_runs_opens_database_read_only(viewer, home, monkeypatch):
+def test_read_page_data_opens_one_read_only_connection_when_columns_are_missing(
+    viewer, home, monkeypatch
+):
     make_db(home, rows=3)
-    calls = []
-    real_connect = sqlite3.connect
+    calls = record_connects(viewer, monkeypatch)
 
-    def recording_connect(*args, **kwargs):
-        calls.append((args, kwargs))
-        return real_connect(*args, **kwargs)
-
-    monkeypatch.setattr(viewer.sqlite3, "connect", recording_connect)
-
-    assert viewer.count_runs() == 3
-    assert len(calls) == 1
-    args, kwargs = calls[0]
-    database = args[0] if args else kwargs["database"]
-    assert "mode=ro" in str(database)
-    assert kwargs.get("uri") is True
+    assert viewer.read_page_data() == viewer.PageData(3, viewer.UNREADABLE)
+    assert_one_read_only_connect(calls)
 
 
-def test_count_runs_leaves_database_file_unchanged(viewer, home):
+def test_read_page_data_tries_to_connect_only_once_when_the_database_is_missing(
+    viewer, home, monkeypatch
+):
+    calls = record_connects(viewer, monkeypatch)
+
+    assert viewer.read_page_data() == viewer.PageData(
+        viewer.UNREADABLE, viewer.UNREADABLE
+    )
+    assert_one_read_only_connect(calls)
+
+
+def test_read_page_data_opens_one_connection_per_call(viewer, home, monkeypatch):
+    make_outcome_db(home, [("passed", "all green")])
+    calls = record_connects(viewer, monkeypatch)
+
+    viewer.read_page_data()
+    viewer.read_page_data()
+    assert len(calls) == 2
+
+
+def test_read_page_data_closes_its_connection_once_after_a_successful_read(
+    viewer, home, monkeypatch
+):
+    make_outcome_db(home, [("passed", "all green")])
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert viewer.read_page_data() == viewer.PageData(
+        1, viewer.LatestRun("passed", "all green")
+    )
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+def test_read_page_data_closes_its_connection_when_the_latest_run_is_unreadable(
+    viewer, home, monkeypatch
+):
+    make_db(home, rows=3)
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert viewer.read_page_data() == viewer.PageData(3, viewer.UNREADABLE)
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+def test_read_page_data_closes_its_connection_when_nothing_is_readable(
+    viewer, home, monkeypatch
+):
+    make_db(home, with_runs_table=False)
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert viewer.read_page_data() == viewer.PageData(
+        viewer.UNREADABLE, viewer.UNREADABLE
+    )
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+# ------------------------------------------------------ read_page_data: one moment
+
+
+def test_read_page_data_count_and_latest_run_come_from_the_same_moment(
+    viewer, home, monkeypatch
+):
+    path = home / "factory.db"
+    # Kept open so the database stays in WAL mode with its -wal and -shm files.
+    holder = sqlite3.connect(path)
+    try:
+        mode = holder.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        assert mode.lower() == "wal"
+        holder.execute(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY, outcome TEXT, reason TEXT)"
+        )
+        holder.execute(
+            "INSERT INTO runs (outcome, reason) VALUES ('passed', 'first run')"
+        )
+        holder.commit()
+
+        real_connect = sqlite3.connect
+        inserted = []
+
+        def insert_second_run_after_the_count(sql):
+            if "COUNT" not in sql.upper() or inserted:
+                return
+            inserted.append("attempted")
+            writer = real_connect(path, timeout=2)
+            try:
+                writer.execute(
+                    "INSERT INTO runs (outcome, reason) VALUES ('failed', 'second run')"
+                )
+                writer.commit()
+                inserted.append("committed")
+            except sqlite3.Error as error:  # reported by the assertion below
+                inserted.append(error)
+            finally:
+                writer.close()
+
+        proxies = wrap_connections(
+            viewer, monkeypatch, insert_second_run_after_the_count
+        )
+
+        data = viewer.read_page_data()
+
+        assert inserted == ["attempted", "committed"], (
+            "the second run must be written between the count and the latest-run read"
+        )
+        assert len(proxies) == 1
+        assert data == viewer.PageData(1, viewer.LatestRun("passed", "first run"))
+
+        # The second run really was committed: the next read shows it.
+        assert viewer.read_page_data() == viewer.PageData(
+            2, viewer.LatestRun("failed", "second run")
+        )
+    finally:
+        holder.close()
+
+
+# -------------------------------------------- read_page_data: never writes or creates
+
+
+def test_read_page_data_does_not_create_a_missing_database_file(viewer, home):
+    viewer.read_page_data()
+    viewer.read_page_data()
+    assert not (home / "factory.db").exists()
+    assert list(home.iterdir()) == []
+
+
+def test_read_page_data_does_not_create_a_missing_home_directory(
+    viewer, tmp_path, monkeypatch
+):
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setenv("TOMFACTORY_HOME", str(missing))
+    viewer.read_page_data()
+    assert not missing.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_read_page_data_leaves_the_database_file_unchanged(viewer, home):
+    path = make_outcome_db(home, [("passed", "all green"), (None, None)])
+    before = path.read_bytes()
+    viewer.read_page_data()
+    viewer.read_page_data()
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_page_data_leaves_an_empty_runs_table_unchanged(viewer, home):
+    path = make_outcome_db(home, [])
+    before = path.read_bytes()
+    assert viewer.read_page_data() == viewer.PageData(0, None)
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_page_data_leaves_a_database_without_outcome_columns_unchanged(
+    viewer, home
+):
     path = make_db(home, rows=3)
     before = path.read_bytes()
-    viewer.count_runs()
-    viewer.count_runs()
+    assert viewer.read_page_data() == viewer.PageData(3, viewer.UNREADABLE)
     assert path.read_bytes() == before
     assert [p.name for p in home.iterdir()] == ["factory.db"]
 
 
-def test_count_runs_leaves_database_without_runs_table_unchanged(viewer, home):
+def test_read_page_data_leaves_a_database_without_runs_table_unchanged(viewer, home):
     path = make_db(home, with_runs_table=False)
     before = path.read_bytes()
-    viewer.count_runs()
+    viewer.read_page_data()
     assert path.read_bytes() == before
     assert [p.name for p in home.iterdir()] == ["factory.db"]
 
 
-# ----------------------------------------------------------------------- render_page
+def test_read_page_data_leaves_an_empty_database_file_empty(viewer, home):
+    path = home / "factory.db"
+    path.write_bytes(b"")
+    viewer.read_page_data()
+    assert path.read_bytes() == b""
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_page_data_leaves_a_non_sqlite_file_unchanged(viewer, home):
+    path = home / "factory.db"
+    content = b"this is definitely not a sqlite database\n" * 50
+    path.write_bytes(content)
+    viewer.read_page_data()
+    assert path.read_bytes() == content
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+# ----------------------------------------------------- read_page_data: between calls
+
+
+def test_read_page_data_called_twice_returns_the_same_value(viewer, home):
+    make_outcome_db(home, [("passed", "all green")])
+    first = viewer.read_page_data()
+    second = viewer.read_page_data()
+    assert first == second == viewer.PageData(
+        1, viewer.LatestRun("passed", "all green")
+    )
+
+
+def test_read_page_data_sees_a_newly_inserted_row_on_the_next_call(viewer, home):
+    path = make_outcome_db(home, [("passed", "all green")])
+    assert viewer.read_page_data() == viewer.PageData(
+        1, viewer.LatestRun("passed", "all green")
+    )
+    insert_outcome_run(path, "failed", "lint errors")
+    assert viewer.read_page_data() == viewer.PageData(
+        2, viewer.LatestRun("failed", "lint errors")
+    )
+
+
+def test_read_page_data_sees_the_latest_row_ending_on_the_next_call(viewer, home):
+    path = make_outcome_db(home, [(None, None)])
+    assert viewer.read_page_data() == viewer.PageData(1, viewer.LatestRun("", ""))
+    execute_sql(path, "UPDATE runs SET outcome = 'passed', reason = 'all green'")
+    assert viewer.read_page_data() == viewer.PageData(
+        1, viewer.LatestRun("passed", "all green")
+    )
+
+
+def test_read_page_data_sees_the_first_row_inserted_into_an_empty_table(viewer, home):
+    path = make_outcome_db(home, [])
+    assert viewer.read_page_data() == viewer.PageData(0, None)
+    insert_outcome_run(path, "passed", "all green")
+    assert viewer.read_page_data() == viewer.PageData(
+        1, viewer.LatestRun("passed", "all green")
+    )
+
+
+def test_read_page_data_recovers_once_the_database_appears(viewer, home):
+    assert viewer.read_page_data() == viewer.PageData(
+        viewer.UNREADABLE, viewer.UNREADABLE
+    )
+    make_outcome_db(home, [("passed", "all green")])
+    assert viewer.read_page_data() == viewer.PageData(
+        1, viewer.LatestRun("passed", "all green")
+    )
+
+
+def test_read_page_data_latest_becomes_readable_once_the_columns_are_added(
+    viewer, home
+):
+    path = make_db(home, rows=2)
+    assert viewer.read_page_data() == viewer.PageData(2, viewer.UNREADABLE)
+    execute_sql(path, "ALTER TABLE runs ADD COLUMN outcome TEXT")
+    execute_sql(path, "ALTER TABLE runs ADD COLUMN reason TEXT")
+    assert viewer.read_page_data() == viewer.PageData(2, viewer.LatestRun("", ""))
+
+
+def test_read_page_data_reads_the_environment_on_every_call(
+    viewer, tmp_path, monkeypatch
+):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    make_outcome_db(first, [("passed", "from first")])
+    make_outcome_db(second, [("failed", "a"), ("failed", "from second")])
+    monkeypatch.setenv("TOMFACTORY_HOME", str(first))
+    assert viewer.read_page_data() == viewer.PageData(
+        1, viewer.LatestRun("passed", "from first")
+    )
+    monkeypatch.setenv("TOMFACTORY_HOME", str(second))
+    assert viewer.read_page_data() == viewer.PageData(
+        2, viewer.LatestRun("failed", "from second")
+    )
+
+
+# ------------------------------------------------------- render_page: the count line
 
 
 def test_render_page_says_hello(viewer, home):
-    assert "<h1>Hello from the factory</h1>" in viewer.render_page(3)
+    page = viewer.render_page(viewer.PageData(3, None))
+    assert "<h1>Hello from the factory</h1>" in page
 
 
 def test_render_page_is_a_complete_html_document_with_title(viewer, home):
-    page = viewer.render_page(3)
+    page = viewer.render_page(viewer.PageData(3, None))
     assert page.lstrip().lower().startswith("<!doctype html>")
     assert "<title>tomfactory viewer</title>" in page
+    assert page.endswith("</body>\n</html>\n")
 
 
 def test_render_page_shows_the_run_count(viewer, home):
-    page = viewer.render_page(3)
+    page = viewer.render_page(viewer.PageData(3, None))
     assert '<p>Runs recorded: <strong id="run-count">3</strong></p>' in page
     assert "run-count-unavailable" not in page
 
 
 def test_render_page_shows_zero_as_a_count_not_as_unavailable(viewer, home):
-    page = viewer.render_page(0)
+    page = viewer.render_page(viewer.PageData(0, None))
     assert '<strong id="run-count">0</strong>' in page
     assert "run-count-unavailable" not in page
 
 
 def test_render_page_shows_a_large_count_in_full(viewer, home):
-    assert '<strong id="run-count">1234567</strong>' in viewer.render_page(1234567)
+    page = viewer.render_page(viewer.PageData(1234567, None))
+    assert '<strong id="run-count">1234567</strong>' in page
 
 
-def test_render_page_shows_unavailable_message_with_database_path_for_none(viewer, home):
-    page = viewer.render_page(None)
-    expected = (
-        '<p id="run-count-unavailable">Run count unavailable: '
-        f"no readable runs table in {html.escape(str(home / 'factory.db'))}</p>"
-    )
-    assert expected in page
+def test_render_page_shows_count_unavailable_with_database_path_for_unreadable_count(
+    viewer, home
+):
+    page = viewer.render_page(viewer.PageData(viewer.UNREADABLE, None))
+    assert count_unavailable_line(home / "factory.db") in page
     assert "<h1>Hello from the factory</h1>" in page
     assert 'id="run-count"' not in page
+    assert "Runs recorded" not in page
 
 
 def test_render_page_escapes_html_in_the_database_path(viewer, tmp_path, monkeypatch):
     nasty = tmp_path / "a&b<i>c"
     monkeypatch.setenv("TOMFACTORY_HOME", str(nasty))
-    page = viewer.render_page(None)
+    page = viewer.render_page(viewer.PageData(viewer.UNREADABLE, None))
     assert html.escape(str(nasty / "factory.db")) in page
     assert "<i>" not in page
     assert "a&b" not in page
+
+
+def test_render_page_takes_one_page_data_and_no_other_argument(viewer, home):
+    data = viewer.PageData(3, None)
+    with pytest.raises(TypeError):
+        viewer.render_page(data, None)
+    with pytest.raises(TypeError):
+        viewer.render_page(data, latest=viewer.LatestRun("passed", "all green"))
+
+
+def test_render_page_called_twice_with_the_same_data_returns_the_same_page(
+    viewer, home
+):
+    data = viewer.PageData(3, viewer.UNREADABLE)
+    assert viewer.render_page(data) == viewer.render_page(data)
+
+
+# ------------------------------------------------- render_page: no runs (latest None)
+
+
+def test_render_page_with_no_latest_run_has_no_latest_run_text(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, None))
+    assert "latest-run" not in page
+    assert "Latest run" not in page
+
+
+def test_render_page_with_no_latest_run_adds_nothing_after_the_count_line(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, None))
+    assert page.endswith(COUNT_LINE.format(3) + "</body>\n</html>\n")
+
+
+def test_render_page_with_zero_runs_and_no_latest_run_says_only_the_count(viewer, home):
+    page = viewer.render_page(viewer.PageData(0, None))
+    assert page.endswith(COUNT_LINE.format(0) + "</body>\n</html>\n")
+    assert "unavailable" not in page
+
+
+def test_render_page_with_unreadable_count_and_no_latest_run_has_no_latest_run_text(
+    viewer, home
+):
+    page = viewer.render_page(viewer.PageData(viewer.UNREADABLE, None))
+    assert 'id="run-count-unavailable"' in page
+    assert "latest-run" not in page
+
+
+# ---------------------------------------- render_page: latest run could not be read
+
+
+def test_render_page_says_latest_run_unavailable_when_latest_is_unreadable(
+    viewer, home
+):
+    page = viewer.render_page(viewer.PageData(3, viewer.UNREADABLE))
+    assert LATEST_UNAVAILABLE_LINE in page
+
+
+def test_render_page_puts_latest_run_unavailable_right_after_the_count_line(
+    viewer, home
+):
+    page = viewer.render_page(viewer.PageData(3, viewer.UNREADABLE))
+    assert page.endswith(
+        COUNT_LINE.format(3) + LATEST_UNAVAILABLE_LINE + "</body>\n</html>\n"
+    )
+
+
+def test_render_page_with_unreadable_latest_shows_no_outcome_reason_or_not_ended(
+    viewer, home
+):
+    page = viewer.render_page(viewer.PageData(3, viewer.UNREADABLE))
+    assert "latest-run-outcome" not in page
+    assert "latest-run-reason" not in page
+    assert "latest-run-not-ended" not in page
+
+
+def test_render_page_with_unreadable_latest_still_shows_the_count(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, viewer.UNREADABLE))
+    assert '<p>Runs recorded: <strong id="run-count">3</strong></p>' in page
+    assert "run-count-unavailable" not in page
+
+
+def test_render_page_shows_latest_run_unavailable_exactly_once(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, viewer.UNREADABLE))
+    assert page.count("latest-run-unavailable") == 1
+
+
+def test_render_page_with_unreadable_latest_only_adds_the_unavailable_line(
+    viewer, home
+):
+    base = viewer.render_page(viewer.PageData(3, None))
+    page = viewer.render_page(viewer.PageData(3, viewer.UNREADABLE))
+    assert page != base
+    assert page.replace(LATEST_UNAVAILABLE_LINE, "") == base
+
+
+def test_render_page_differs_between_no_runs_and_an_unreadable_latest_run(viewer, home):
+    empty = viewer.render_page(viewer.PageData(0, None))
+    unreadable = viewer.render_page(viewer.PageData(0, viewer.UNREADABLE))
+    assert empty != unreadable
+    assert "latest-run-unavailable" not in empty
+    assert LATEST_UNAVAILABLE_LINE in unreadable
+    assert '<strong id="run-count">0</strong>' in unreadable
+
+
+def test_render_page_shows_both_unavailable_lines_when_nothing_could_be_read(
+    viewer, home
+):
+    page = viewer.render_page(viewer.PageData(viewer.UNREADABLE, viewer.UNREADABLE))
+    assert count_unavailable_line(home / "factory.db") in page
+    assert LATEST_UNAVAILABLE_LINE in page
+    assert 'id="run-count"' not in page
+    assert "<h1>Hello from the factory</h1>" in page
+
+
+def test_render_page_puts_count_unavailable_before_latest_run_unavailable(viewer, home):
+    page = viewer.render_page(viewer.PageData(viewer.UNREADABLE, viewer.UNREADABLE))
+    assert page.endswith(
+        count_unavailable_line(home / "factory.db")
+        + LATEST_UNAVAILABLE_LINE
+        + "</body>\n</html>\n"
+    )
+
+
+# ------------------------------------------------------ render_page: a latest run
+
+
+def test_render_page_shows_outcome_and_reason_of_an_ended_run(viewer, home):
+    page = viewer.render_page(
+        viewer.PageData(3, viewer.LatestRun("passed", "all green"))
+    )
+    assert OUTCOME_LINE.format("passed") in page
+    assert REASON_LINE.format("all green") in page
+    assert "latest-run-not-ended" not in page
+    assert "latest-run-unavailable" not in page
+
+
+def test_render_page_puts_latest_run_lines_right_after_the_count_line(viewer, home):
+    page = viewer.render_page(
+        viewer.PageData(3, viewer.LatestRun("failed", "tests red"))
+    )
+    expected = (
+        COUNT_LINE.format(3)
+        + OUTCOME_LINE.format("failed")
+        + REASON_LINE.format("tests red")
+        + "</body>\n"
+        "</html>\n"
+    )
+    assert page.endswith(expected)
+
+
+def test_render_page_with_ended_run_only_adds_the_two_latest_run_lines(viewer, home):
+    base = viewer.render_page(viewer.PageData(3, None))
+    page = viewer.render_page(
+        viewer.PageData(3, viewer.LatestRun("passed", "all green"))
+    )
+    added = OUTCOME_LINE.format("passed") + REASON_LINE.format("all green")
+    assert page.replace(added, "") == base
+    assert page != base
+
+
+def test_render_page_omits_reason_line_when_ended_run_has_empty_reason(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, viewer.LatestRun("passed", "")))
+    assert OUTCOME_LINE.format("passed") in page
+    assert "latest-run-reason" not in page
+    assert "Latest run reason" not in page
+    assert "latest-run-not-ended" not in page
+
+
+def test_render_page_shows_not_ended_line_for_a_run_with_empty_outcome(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, viewer.LatestRun("", "")))
+    assert NOT_ENDED_LINE in page
+    assert "latest-run-outcome" not in page
+    assert "latest-run-reason" not in page
+    assert "latest-run-unavailable" not in page
+
+
+def test_render_page_puts_not_ended_line_right_after_the_count_line(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, viewer.LatestRun("", "")))
+    expected = COUNT_LINE.format(3) + NOT_ENDED_LINE + "</body>\n</html>\n"
+    assert page.endswith(expected)
+
+
+def test_render_page_shows_not_ended_and_hides_reason_when_outcome_is_empty(
+    viewer, home
+):
+    page = viewer.render_page(viewer.PageData(3, viewer.LatestRun("", "still going")))
+    assert NOT_ENDED_LINE in page
+    assert "latest-run-outcome" not in page
+    assert "latest-run-reason" not in page
+    assert "still going" not in page
+
+
+def test_render_page_shows_not_ended_line_exactly_once(viewer, home):
+    page = viewer.render_page(viewer.PageData(1, viewer.LatestRun("", "")))
+    assert page.count("latest-run-not-ended") == 1
+
+
+def test_render_page_shows_outcome_and_reason_elements_exactly_once(viewer, home):
+    page = viewer.render_page(
+        viewer.PageData(1, viewer.LatestRun("passed", "all green"))
+    )
+    assert page.count('id="latest-run-outcome"') == 1
+    assert page.count('id="latest-run-reason"') == 1
+
+
+def test_render_page_escapes_html_in_the_outcome(viewer, home):
+    page = viewer.render_page(viewer.PageData(3, viewer.LatestRun("<b>&", "fine")))
+    assert OUTCOME_LINE.format("&lt;b&gt;&amp;") in page
+    assert "<b>" not in page
+    assert "<b>&" not in page
+
+
+def test_render_page_escapes_html_in_the_reason(viewer, home):
+    page = viewer.render_page(
+        viewer.PageData(
+            3, viewer.LatestRun("failed", "<script>alert(1)</script> & more")
+        )
+    )
+    assert (
+        REASON_LINE.format("&lt;script&gt;alert(1)&lt;/script&gt; &amp; more") in page
+    )
+    assert "<script>" not in page
+
+
+def test_render_page_escapes_quotes_in_outcome_and_reason(viewer, home):
+    page = viewer.render_page(
+        viewer.PageData(3, viewer.LatestRun('say "hi"', "it's \"bad\""))
+    )
+    assert OUTCOME_LINE.format(html.escape('say "hi"')) in page
+    assert REASON_LINE.format(html.escape("it's \"bad\"")) in page
+    assert 'say "hi"' not in page
+
+
+def test_render_page_keeps_the_count_line_alongside_an_ended_run(viewer, home):
+    page = viewer.render_page(
+        viewer.PageData(3, viewer.LatestRun("passed", "all green"))
+    )
+    assert '<p>Runs recorded: <strong id="run-count">3</strong></p>' in page
+    assert "<h1>Hello from the factory</h1>" in page
+    assert "latest-run-outcome" in page
+
+
+def test_render_page_keeps_the_count_line_alongside_a_not_ended_run(viewer, home):
+    page = viewer.render_page(viewer.PageData(1, viewer.LatestRun("", "")))
+    assert '<p>Runs recorded: <strong id="run-count">1</strong></p>' in page
+    assert 'id="latest-run-not-ended"' in page
+
+
+def test_render_page_shows_latest_run_even_when_count_is_unreadable(viewer, home):
+    page = viewer.render_page(
+        viewer.PageData(viewer.UNREADABLE, viewer.LatestRun("passed", "all green"))
+    )
+    assert 'id="run-count-unavailable"' in page
+    assert OUTCOME_LINE.format("passed") in page
+    assert REASON_LINE.format("all green") in page
+    assert "latest-run-unavailable" not in page
+
+
+def test_render_page_shows_multiline_reason_in_full(viewer, home):
+    reason = "line one\nline two"
+    page = viewer.render_page(viewer.PageData(3, viewer.LatestRun("failed", reason)))
+    assert REASON_LINE.format(reason) in page
+
+
+# ------------------------------------------- render_page does not read the database
+
+
+def test_render_page_does_not_open_the_database_for_a_latest_run(
+    viewer, home, monkeypatch
+):
+    make_outcome_db(home, [("failed", "from the database")])
+
+    def forbidden_connect(*args, **kwargs):
+        raise AssertionError("render_page must not open the database")
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", forbidden_connect)
+
+    page = viewer.render_page(
+        viewer.PageData(1, viewer.LatestRun("passed", "given by the caller"))
+    )
+    assert OUTCOME_LINE.format("passed") in page
+    assert REASON_LINE.format("given by the caller") in page
+    assert "from the database" not in page
+
+
+def test_render_page_does_not_open_the_database_when_told_nothing_was_readable(
+    viewer, home, monkeypatch
+):
+    make_outcome_db(home, [("failed", "from the database")])
+
+    def forbidden_connect(*args, **kwargs):
+        raise AssertionError("render_page must not open the database")
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", forbidden_connect)
+
+    page = viewer.render_page(viewer.PageData(viewer.UNREADABLE, viewer.UNREADABLE))
+    assert 'id="run-count-unavailable"' in page
+    assert LATEST_UNAVAILABLE_LINE in page
+    assert 'id="run-count"' not in page
+    assert "from the database" not in page
+
+
+def test_render_page_with_no_latest_run_ignores_runs_in_the_database(viewer, home):
+    make_outcome_db(home, [("failed", "from the database")])
+    page = viewer.render_page(viewer.PageData(1, None))
+    assert "latest-run" not in page
+    assert "from the database" not in page
 
 
 # ----------------------------------------------------------------------- HTTP server
@@ -311,10 +1251,38 @@ def test_get_root_content_length_matches_body(home, port):
     assert len(body) > 0
 
 
-def test_get_root_body_is_the_rendered_page(viewer, home, port):
-    make_db(home, rows=3)
+def test_get_root_body_is_the_page_rendered_from_the_page_data(viewer, home, port):
+    make_outcome_db(home, [("failed", "old"), ("passed", "all green")])
     _, _, body = fetch(port)
-    assert body.decode("utf-8") == viewer.render_page(3)
+    assert body.decode("utf-8") == viewer.render_page(viewer.read_page_data())
+    assert b"latest-run-outcome" in body
+
+
+def test_get_root_opens_one_read_only_connection_per_request(
+    viewer, home, port, monkeypatch
+):
+    make_outcome_db(home, [("passed", "all green"), ("failed", "tests red")])
+    calls = record_connects(viewer, monkeypatch)
+
+    status, _, body = fetch(port)
+    text = body.decode("utf-8")
+
+    assert status == 200
+    assert '<strong id="run-count">2</strong>' in text
+    assert OUTCOME_LINE.format("failed") in text
+    assert_one_read_only_connect(calls)
+
+
+def test_get_root_opens_one_read_only_connection_when_the_database_is_missing(
+    viewer, home, port, monkeypatch
+):
+    calls = record_connects(viewer, monkeypatch)
+
+    status, _, body = fetch(port)
+
+    assert status == 200
+    assert LATEST_UNAVAILABLE_LINE in body.decode("utf-8")
+    assert_one_read_only_connect(calls)
 
 
 def test_get_root_shows_zero_for_empty_runs_table(home, port):
@@ -351,44 +1319,125 @@ def test_get_root_ignores_query_string(home, port):
     assert '<strong id="run-count">3</strong>' in body.decode("utf-8")
 
 
-def test_get_root_without_database_returns_200_with_unavailable_message(home, port):
+def test_get_root_without_database_returns_200_with_both_unavailable_lines(
+    viewer, home, port
+):
     status, headers, body = fetch(port)
     text = body.decode("utf-8")
     assert status == 200
     assert headers["Content-Type"].startswith("text/html")
     assert "Hello from the factory" in text
-    assert 'id="run-count-unavailable"' in text
+    assert (
+        count_unavailable_line(home / "factory.db") + LATEST_UNAVAILABLE_LINE in text
+    )
     assert 'id="run-count"' not in text
+    assert text == viewer.render_page(
+        viewer.PageData(viewer.UNREADABLE, viewer.UNREADABLE)
+    )
 
 
 def test_get_root_without_database_does_not_create_it(home, port):
-    fetch(port)
+    status, _, body = fetch(port)
+    assert status == 200
+    assert LATEST_UNAVAILABLE_LINE in body.decode("utf-8")
     assert not (home / "factory.db").exists()
+    assert list(home.iterdir()) == []
 
 
-def test_get_root_without_runs_table_returns_200_with_unavailable_message(home, port):
+def test_get_root_without_runs_table_returns_200_with_both_unavailable_lines(
+    home, port
+):
     make_db(home, with_runs_table=False)
     status, _, body = fetch(port)
     text = body.decode("utf-8")
     assert status == 200
     assert "Hello from the factory" in text
     assert 'id="run-count-unavailable"' in text
+    assert LATEST_UNAVAILABLE_LINE in text
+    assert 'id="run-count"' not in text
+
+
+def test_get_root_with_non_sqlite_file_returns_200_with_both_unavailable_lines(
+    home, port
+):
+    _write_non_sqlite_file(home)
+    status, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert status == 200
+    assert 'id="run-count-unavailable"' in text
+    assert LATEST_UNAVAILABLE_LINE in text
+
+
+def test_get_root_with_empty_runs_table_shows_zero_and_no_latest_run(
+    viewer, home, port
+):
+    make_outcome_db(home, [])
+    status, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert status == 200
+    assert '<strong id="run-count">0</strong>' in text
+    assert "latest-run" not in text
+    assert text == viewer.render_page(viewer.PageData(0, None))
+
+
+def test_get_root_with_runs_lacking_outcome_columns_shows_count_and_unavailable_line(
+    viewer, home, port
+):
+    make_db(home, rows=3)
+    status, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert status == 200
+    assert COUNT_LINE.format(3) + LATEST_UNAVAILABLE_LINE in text
+    assert "run-count-unavailable" not in text
+    assert "latest-run-outcome" not in text
+    assert "latest-run-not-ended" not in text
+    assert text == viewer.render_page(viewer.PageData(3, viewer.UNREADABLE))
+
+
+def test_get_root_content_length_matches_body_with_latest_run_unavailable(home, port):
+    make_db(home, rows=3)
+    _, headers, body = fetch(port)
+    assert LATEST_UNAVAILABLE_LINE.encode("utf-8") in body
+    assert int(headers["Content-Length"]) == len(body)
 
 
 def test_get_root_recovers_once_database_appears(home, port):
     _, _, before = fetch(port)
-    assert 'id="run-count-unavailable"' in before.decode("utf-8")
+    text = before.decode("utf-8")
+    assert 'id="run-count-unavailable"' in text
+    assert LATEST_UNAVAILABLE_LINE in text
 
-    make_db(home, rows=2)
+    make_outcome_db(home, [("passed", "all green"), ("failed", "tests red")])
 
     _, _, after = fetch(port)
-    assert '<strong id="run-count">2</strong>' in after.decode("utf-8")
+    text = after.decode("utf-8")
+    assert '<strong id="run-count">2</strong>' in text
+    assert OUTCOME_LINE.format("failed") in text
+    assert "unavailable" not in text
+
+
+def test_get_root_stops_saying_latest_run_unavailable_once_the_columns_are_added(
+    home, port
+):
+    path = make_db(home, rows=2)
+    _, _, before = fetch(port)
+    assert LATEST_UNAVAILABLE_LINE in before.decode("utf-8")
+
+    execute_sql(path, "ALTER TABLE runs ADD COLUMN outcome TEXT")
+    execute_sql(path, "ALTER TABLE runs ADD COLUMN reason TEXT")
+
+    _, _, after = fetch(port)
+    text = after.decode("utf-8")
+    assert "latest-run-unavailable" not in text
+    assert NOT_ENDED_LINE in text
+    assert '<strong id="run-count">2</strong>' in text
 
 
 def test_get_root_leaves_database_file_unchanged(home, port):
     path = make_db(home, rows=3)
     before = path.read_bytes()
-    fetch(port)
+    _, _, body = fetch(port)
+    assert LATEST_UNAVAILABLE_LINE.encode("utf-8") in body
     assert path.read_bytes() == before
     assert [p.name for p in home.iterdir()] == ["factory.db"]
 
@@ -425,6 +1474,139 @@ def test_make_server_binds_to_localhost(viewer, home):
         assert server.server_address[1] != 0
     finally:
         server.server_close()
+
+
+# ---------------------------------------------------------- HTTP server, latest run
+
+
+def test_get_root_shows_outcome_and_reason_of_the_ended_latest_run(home, port):
+    make_outcome_db(home, [("failed", "old"), ("passed", "all green")])
+    status, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert status == 200
+    assert OUTCOME_LINE.format("passed") in text
+    assert REASON_LINE.format("all green") in text
+    assert '<strong id="run-count">2</strong>' in text
+    assert "old" not in text
+
+
+def test_get_root_shows_not_ended_line_for_a_not_ended_latest_run(home, port):
+    make_outcome_db(home, [("passed", "all green"), (None, None)])
+    status, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert status == 200
+    assert NOT_ENDED_LINE in text
+    assert "latest-run-outcome" not in text
+    assert "latest-run-reason" not in text
+    assert "all green" not in text
+
+
+def test_get_root_shows_not_ended_line_for_latest_run_with_empty_strings(home, port):
+    make_outcome_db(home, [("", "")])
+    _, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert NOT_ENDED_LINE in text
+    assert "latest-run-outcome" not in text
+
+
+def test_get_root_omits_reason_when_ended_latest_run_has_no_reason(home, port):
+    make_outcome_db(home, [("passed", None)])
+    _, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert OUTCOME_LINE.format("passed") in text
+    assert "latest-run-reason" not in text
+
+
+def test_get_root_shows_outcome_once_the_latest_run_has_ended(home, port):
+    path = make_outcome_db(home, [(None, None)])
+    _, _, first = fetch(port)
+    assert NOT_ENDED_LINE in first.decode("utf-8")
+
+    execute_sql(path, "UPDATE runs SET outcome = 'failed', reason = 'tests red'")
+
+    status, _, second = fetch(port)
+    text = second.decode("utf-8")
+    assert status == 200
+    assert OUTCOME_LINE.format("failed") in text
+    assert REASON_LINE.format("tests red") in text
+    assert "latest-run-not-ended" not in text
+
+
+def test_get_root_shows_a_newer_run_inserted_while_serving(home, port):
+    path = make_outcome_db(home, [("passed", "all green")])
+    _, _, first = fetch(port)
+    assert OUTCOME_LINE.format("passed") in first.decode("utf-8")
+
+    insert_outcome_run(path, None, None)
+
+    _, _, second = fetch(port)
+    text = second.decode("utf-8")
+    assert NOT_ENDED_LINE in text
+    assert "latest-run-outcome" not in text
+    assert '<strong id="run-count">2</strong>' in text
+
+
+def test_get_root_escapes_html_in_outcome_and_reason(home, port):
+    make_outcome_db(home, [("<b>&", "<i>why</i>")])
+    _, _, body = fetch(port)
+    text = body.decode("utf-8")
+    assert OUTCOME_LINE.format("&lt;b&gt;&amp;") in text
+    assert REASON_LINE.format("&lt;i&gt;why&lt;/i&gt;") in text
+    assert "<b>" not in text
+    assert "<i>" not in text
+
+
+def test_get_root_content_length_matches_body_with_non_ascii_reason(home, port):
+    make_outcome_db(home, [("passed", "café ✓")])
+    _, headers, body = fetch(port)
+    assert REASON_LINE.format("café ✓") in body.decode("utf-8")
+    assert int(headers["Content-Length"]) == len(body)
+
+
+def test_get_root_twice_returns_the_same_page_with_a_latest_run(home, port):
+    make_outcome_db(home, [("passed", "all green")])
+    first = fetch(port)
+    second = fetch(port)
+    assert first[0] == second[0] == 200
+    assert first[2] == second[2]
+    assert b'id="latest-run-outcome"' in first[2]
+
+
+def test_get_root_twice_returns_the_same_page_when_latest_run_is_unavailable(
+    home, port
+):
+    make_db(home, rows=3)
+    first = fetch(port)
+    second = fetch(port)
+    assert first[0] == second[0] == 200
+    assert first[2] == second[2]
+    assert b'id="latest-run-unavailable"' in first[2]
+
+
+def test_get_root_leaves_database_with_outcome_columns_unchanged(home, port):
+    path = make_outcome_db(home, [("passed", "all green"), (None, None)])
+    before = path.read_bytes()
+    _, _, body = fetch(port)
+    assert b'id="latest-run-not-ended"' in body
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_get_unknown_path_does_not_show_the_latest_run(viewer, home, port):
+    make_outcome_db(home, [("passed", "all green")])
+    assert viewer.read_page_data().latest == viewer.LatestRun("passed", "all green")
+    status, _, body = fetch(port, "/latest")
+    assert status == 404
+    assert b"latest-run" not in body
+
+
+def test_get_unknown_path_does_not_open_the_database(viewer, home, port, monkeypatch):
+    make_outcome_db(home, [("passed", "all green")])
+    assert viewer.read_page_data().count == 1
+    calls = record_connects(viewer, monkeypatch)
+    status, _, _ = fetch(port, "/nope")
+    assert status == 404
+    assert calls == []
 
 
 # ------------------------------------------------------------------------------ main
@@ -518,596 +1700,3 @@ def test_viewer_imports_only_the_standard_library(viewer):
     assert imported <= set(sys.stdlib_module_names), (
         f"non-stdlib imports: {sorted(imported - set(sys.stdlib_module_names))}"
     )
-
-
-# ====================================================================================
-# Latest run: outcome and reason of the run with the highest id
-# ====================================================================================
-
-OUTCOME_LINE = '<p>Latest run outcome: <strong id="latest-run-outcome">{}</strong></p>\n'
-REASON_LINE = '<p>Latest run reason: <span id="latest-run-reason">{}</span></p>\n'
-NOT_ENDED_LINE = '<p id="latest-run-not-ended">Latest run has not ended yet</p>\n'
-
-
-def make_outcome_db(home, runs=()):
-    """Create ``home/factory.db`` whose ``runs`` table has outcome and reason columns.
-
-    ``runs`` is a sequence of ``(outcome, reason)`` pairs, inserted in order.
-    """
-    home.mkdir(parents=True, exist_ok=True)
-    path = home / "factory.db"
-    conn = sqlite3.connect(path)
-    try:
-        conn.execute(
-            "CREATE TABLE runs (id INTEGER PRIMARY KEY, outcome TEXT, reason TEXT)"
-        )
-        conn.executemany("INSERT INTO runs (outcome, reason) VALUES (?, ?)", list(runs))
-        conn.commit()
-    finally:
-        conn.close()
-    return path
-
-
-def execute_sql(path, sql, params=()):
-    conn = sqlite3.connect(path)
-    try:
-        conn.execute(sql, params)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def insert_outcome_run(path, outcome, reason, run_id=None):
-    execute_sql(
-        path,
-        "INSERT INTO runs (id, outcome, reason) VALUES (?, ?, ?)",
-        (run_id, outcome, reason),
-    )
-
-
-# ------------------------------------------------------------------------ latest_run
-
-
-def test_latest_run_returns_outcome_and_reason_of_a_single_ended_run(viewer, home):
-    make_outcome_db(home, [("passed", "all green")])
-    assert viewer.latest_run() == viewer.LatestRun("passed", "all green")
-
-
-def test_latest_run_returns_a_latest_run_with_outcome_and_reason_fields(viewer, home):
-    make_outcome_db(home, [("failed", "tests red")])
-    latest = viewer.latest_run()
-    assert isinstance(latest, viewer.LatestRun)
-    assert latest.outcome == "failed"
-    assert latest.reason == "tests red"
-
-
-def test_latest_run_returns_the_row_with_the_highest_id(viewer, home):
-    make_outcome_db(
-        home, [("passed", "first"), ("failed", "second"), ("passed", "third")]
-    )
-    assert viewer.latest_run() == viewer.LatestRun("passed", "third")
-
-
-def test_latest_run_uses_highest_id_not_insertion_order(viewer, home):
-    path = make_outcome_db(home)
-    insert_outcome_run(path, "failed", "newest by id", run_id=50)
-    insert_outcome_run(path, "passed", "inserted last", run_id=7)
-    assert viewer.latest_run() == viewer.LatestRun("failed", "newest by id")
-
-
-def test_latest_run_is_the_not_ended_row_when_older_rows_have_ended(viewer, home):
-    make_outcome_db(home, [("passed", "all green"), ("failed", "boom"), (None, None)])
-    assert viewer.latest_run() == viewer.LatestRun("", "")
-
-
-def test_latest_run_ignores_older_not_ended_rows(viewer, home):
-    make_outcome_db(home, [(None, None), ("", ""), ("passed", "all green")])
-    assert viewer.latest_run() == viewer.LatestRun("passed", "all green")
-
-
-def test_latest_run_returns_empty_strings_for_null_columns(viewer, home):
-    make_outcome_db(home, [(None, None)])
-    latest = viewer.latest_run()
-    assert latest is not None
-    assert latest == viewer.LatestRun("", "")
-    assert latest.outcome == ""
-    assert latest.reason == ""
-
-
-def test_latest_run_returns_empty_strings_for_empty_string_columns(viewer, home):
-    make_outcome_db(home, [("", "")])
-    latest = viewer.latest_run()
-    assert latest is not None
-    assert latest == viewer.LatestRun("", "")
-
-
-def test_latest_run_returns_empty_reason_when_ended_run_has_null_reason(viewer, home):
-    make_outcome_db(home, [("passed", None)])
-    assert viewer.latest_run() == viewer.LatestRun("passed", "")
-
-
-def test_latest_run_keeps_reason_when_outcome_is_null(viewer, home):
-    make_outcome_db(home, [(None, "still going")])
-    assert viewer.latest_run() == viewer.LatestRun("", "still going")
-
-
-def test_latest_run_returns_text_unchanged_including_markup_and_unicode(viewer, home):
-    make_outcome_db(home, [("<b>&", "café ✓ 'quoted'")])
-    assert viewer.latest_run() == viewer.LatestRun("<b>&", "café ✓ 'quoted'")
-
-
-def test_latest_run_returns_none_for_empty_runs_table(viewer, home):
-    make_outcome_db(home, [])
-    assert viewer.count_runs() == 0
-    assert viewer.latest_run() is None
-
-
-def test_latest_run_returns_none_when_database_file_is_missing(viewer, home):
-    assert viewer.latest_run() is None
-
-
-def test_latest_run_does_not_create_missing_database_file(viewer, home):
-    viewer.latest_run()
-    assert not (home / "factory.db").exists()
-    assert list(home.iterdir()) == []
-
-
-def test_latest_run_returns_none_and_does_not_create_missing_home_directory(
-    viewer, tmp_path, monkeypatch
-):
-    missing = tmp_path / "does-not-exist"
-    monkeypatch.setenv("TOMFACTORY_HOME", str(missing))
-    assert viewer.latest_run() is None
-    assert not missing.exists()
-
-
-def test_latest_run_returns_none_when_runs_table_is_missing(viewer, home):
-    make_db(home, with_runs_table=False)
-    assert viewer.latest_run() is None
-
-
-def test_latest_run_returns_none_when_runs_has_no_outcome_or_reason_columns(
-    viewer, home
-):
-    make_db(home, rows=3)
-    assert viewer.latest_run() is None
-
-
-def test_latest_run_returns_none_when_runs_has_outcome_but_no_reason_column(
-    viewer, home
-):
-    path = make_db(home, with_runs_table=False)
-    execute_sql(path, "CREATE TABLE runs (id INTEGER PRIMARY KEY, outcome TEXT)")
-    execute_sql(path, "INSERT INTO runs (outcome) VALUES ('passed')")
-    assert viewer.latest_run() is None
-
-
-def test_latest_run_returns_none_when_file_is_not_a_sqlite_database(viewer, home):
-    (home / "factory.db").write_bytes(b"this is definitely not a sqlite database\n" * 50)
-    assert viewer.latest_run() is None
-
-
-def test_latest_run_returns_none_when_database_file_is_empty(viewer, home):
-    (home / "factory.db").write_bytes(b"")
-    assert viewer.latest_run() is None
-
-
-def test_latest_run_returns_none_when_factory_db_is_a_directory(viewer, home):
-    (home / "factory.db").mkdir()
-    assert viewer.latest_run() is None
-
-
-def test_latest_run_works_when_home_path_contains_a_space(viewer, tmp_path, monkeypatch):
-    spaced = tmp_path / "factory home"
-    make_outcome_db(spaced, [("passed", "all green")])
-    monkeypatch.setenv("TOMFACTORY_HOME", str(spaced))
-    assert viewer.latest_run() == viewer.LatestRun("passed", "all green")
-
-
-def test_latest_run_opens_database_read_only_with_one_connection(
-    viewer, home, monkeypatch
-):
-    make_outcome_db(home, [("passed", "all green")])
-    calls = []
-    real_connect = sqlite3.connect
-
-    def recording_connect(*args, **kwargs):
-        calls.append((args, kwargs))
-        return real_connect(*args, **kwargs)
-
-    monkeypatch.setattr(viewer.sqlite3, "connect", recording_connect)
-
-    assert viewer.latest_run() == viewer.LatestRun("passed", "all green")
-    assert len(calls) == 1
-    args, kwargs = calls[0]
-    database = args[0] if args else kwargs["database"]
-    assert "mode=ro" in str(database)
-    assert kwargs.get("uri") is True
-
-
-def test_latest_run_leaves_database_file_unchanged(viewer, home):
-    path = make_outcome_db(home, [("passed", "all green"), (None, None)])
-    before = path.read_bytes()
-    viewer.latest_run()
-    viewer.latest_run()
-    assert path.read_bytes() == before
-    assert [p.name for p in home.iterdir()] == ["factory.db"]
-
-
-def test_latest_run_leaves_database_without_outcome_columns_unchanged(viewer, home):
-    path = make_db(home, rows=3)
-    before = path.read_bytes()
-    assert viewer.latest_run() is None
-    assert path.read_bytes() == before
-    assert [p.name for p in home.iterdir()] == ["factory.db"]
-
-
-def test_latest_run_called_twice_returns_the_same_value(viewer, home):
-    make_outcome_db(home, [("passed", "all green")])
-    assert viewer.latest_run() == viewer.latest_run() == ("passed", "all green")
-
-
-def test_latest_run_sees_a_newly_inserted_row_on_the_next_call(viewer, home):
-    path = make_outcome_db(home, [("passed", "all green")])
-    assert viewer.latest_run() == viewer.LatestRun("passed", "all green")
-    insert_outcome_run(path, "failed", "lint errors")
-    assert viewer.latest_run() == viewer.LatestRun("failed", "lint errors")
-
-
-def test_latest_run_sees_the_latest_row_ending_on_the_next_call(viewer, home):
-    path = make_outcome_db(home, [(None, None)])
-    assert viewer.latest_run() == viewer.LatestRun("", "")
-    execute_sql(path, "UPDATE runs SET outcome = 'passed', reason = 'all green'")
-    assert viewer.latest_run() == viewer.LatestRun("passed", "all green")
-
-
-def test_latest_run_sees_the_first_row_inserted_into_an_empty_table(viewer, home):
-    path = make_outcome_db(home, [])
-    assert viewer.latest_run() is None
-    insert_outcome_run(path, "passed", "all green")
-    assert viewer.latest_run() == viewer.LatestRun("passed", "all green")
-
-
-def test_count_runs_still_counts_rows_when_runs_has_outcome_columns(
-    viewer, home, monkeypatch
-):
-    # Guards count_runs while it is rebuilt on the shared read helper; latest_run is
-    # called too so that this test describes the change rather than today's code.
-    make_outcome_db(home, [("passed", "a"), (None, None)])
-    assert viewer.latest_run() == viewer.LatestRun("", "")
-    assert viewer.count_runs() == 2
-
-
-# ------------------------------------------------------- render_page with latest run
-
-
-def test_render_page_without_latest_is_the_same_as_with_latest_none(viewer, home):
-    page = viewer.render_page(3, None)
-    assert page == viewer.render_page(3)
-    assert "latest-run" not in page
-
-
-def test_render_page_with_latest_none_adds_nothing_after_the_count_line(viewer, home):
-    page = viewer.render_page(3, None)
-    assert (
-        '<p>Runs recorded: <strong id="run-count">3</strong></p>\n</body>\n' in page
-    )
-    assert "Latest run" not in page
-
-
-def test_render_page_with_unavailable_count_and_latest_none_has_no_latest_run(
-    viewer, home
-):
-    page = viewer.render_page(None, None)
-    assert page == viewer.render_page(None)
-    assert 'id="run-count-unavailable"' in page
-    assert "latest-run" not in page
-
-
-def test_render_page_accepts_latest_as_a_keyword_argument(viewer, home):
-    latest = viewer.LatestRun("passed", "all green")
-    assert viewer.render_page(3, latest=latest) == viewer.render_page(3, latest)
-    assert "latest-run-outcome" in viewer.render_page(3, latest=latest)
-
-
-def test_render_page_shows_outcome_and_reason_of_an_ended_run(viewer, home):
-    page = viewer.render_page(3, viewer.LatestRun("passed", "all green"))
-    assert OUTCOME_LINE.format("passed") in page
-    assert REASON_LINE.format("all green") in page
-    assert "latest-run-not-ended" not in page
-
-
-def test_render_page_puts_latest_run_lines_right_after_the_count_line(viewer, home):
-    page = viewer.render_page(3, viewer.LatestRun("failed", "tests red"))
-    expected = (
-        '<p>Runs recorded: <strong id="run-count">3</strong></p>\n'
-        + OUTCOME_LINE.format("failed")
-        + REASON_LINE.format("tests red")
-        + "</body>\n"
-        "</html>\n"
-    )
-    assert page.endswith(expected)
-
-
-def test_render_page_with_ended_run_only_adds_the_two_latest_run_lines(viewer, home):
-    base = viewer.render_page(3)
-    page = viewer.render_page(3, viewer.LatestRun("passed", "all green"))
-    added = OUTCOME_LINE.format("passed") + REASON_LINE.format("all green")
-    assert page.replace(added, "") == base
-    assert page != base
-
-
-def test_render_page_omits_reason_line_when_ended_run_has_empty_reason(viewer, home):
-    page = viewer.render_page(3, viewer.LatestRun("passed", ""))
-    assert OUTCOME_LINE.format("passed") in page
-    assert "latest-run-reason" not in page
-    assert "Latest run reason" not in page
-    assert "latest-run-not-ended" not in page
-
-
-def test_render_page_shows_not_ended_line_for_a_run_with_empty_outcome(viewer, home):
-    page = viewer.render_page(3, viewer.LatestRun("", ""))
-    assert NOT_ENDED_LINE in page
-    assert "latest-run-outcome" not in page
-    assert "latest-run-reason" not in page
-
-
-def test_render_page_puts_not_ended_line_right_after_the_count_line(viewer, home):
-    page = viewer.render_page(3, viewer.LatestRun("", ""))
-    expected = (
-        '<p>Runs recorded: <strong id="run-count">3</strong></p>\n'
-        + NOT_ENDED_LINE
-        + "</body>\n"
-        "</html>\n"
-    )
-    assert page.endswith(expected)
-
-
-def test_render_page_shows_not_ended_and_hides_reason_when_outcome_is_empty(
-    viewer, home
-):
-    page = viewer.render_page(3, viewer.LatestRun("", "still going"))
-    assert NOT_ENDED_LINE in page
-    assert "latest-run-outcome" not in page
-    assert "latest-run-reason" not in page
-    assert "still going" not in page
-
-
-def test_render_page_shows_not_ended_line_exactly_once(viewer, home):
-    page = viewer.render_page(1, viewer.LatestRun("", ""))
-    assert page.count("latest-run-not-ended") == 1
-
-
-def test_render_page_shows_outcome_and_reason_elements_exactly_once(viewer, home):
-    page = viewer.render_page(1, viewer.LatestRun("passed", "all green"))
-    assert page.count('id="latest-run-outcome"') == 1
-    assert page.count('id="latest-run-reason"') == 1
-
-
-def test_render_page_escapes_html_in_the_outcome(viewer, home):
-    page = viewer.render_page(3, viewer.LatestRun("<b>&", "fine"))
-    assert OUTCOME_LINE.format("&lt;b&gt;&amp;") in page
-    assert "<b>" not in page
-    assert "<b>&" not in page
-
-
-def test_render_page_escapes_html_in_the_reason(viewer, home):
-    page = viewer.render_page(
-        3, viewer.LatestRun("failed", "<script>alert(1)</script> & more")
-    )
-    assert (
-        REASON_LINE.format("&lt;script&gt;alert(1)&lt;/script&gt; &amp; more") in page
-    )
-    assert "<script>" not in page
-
-
-def test_render_page_escapes_quotes_in_outcome_and_reason(viewer, home):
-    page = viewer.render_page(3, viewer.LatestRun('say "hi"', "it's \"bad\""))
-    assert OUTCOME_LINE.format(html.escape('say "hi"')) in page
-    assert REASON_LINE.format(html.escape("it's \"bad\"")) in page
-    assert 'say "hi"' not in page
-
-
-def test_render_page_keeps_the_count_line_alongside_an_ended_run(viewer, home):
-    page = viewer.render_page(3, viewer.LatestRun("passed", "all green"))
-    assert '<p>Runs recorded: <strong id="run-count">3</strong></p>' in page
-    assert "<h1>Hello from the factory</h1>" in page
-    assert "latest-run-outcome" in page
-
-
-def test_render_page_keeps_the_count_line_alongside_a_not_ended_run(viewer, home):
-    page = viewer.render_page(1, viewer.LatestRun("", ""))
-    assert '<p>Runs recorded: <strong id="run-count">1</strong></p>' in page
-    assert 'id="latest-run-not-ended"' in page
-
-
-def test_render_page_shows_latest_run_even_when_count_is_unavailable(viewer, home):
-    page = viewer.render_page(None, viewer.LatestRun("passed", "all green"))
-    assert 'id="run-count-unavailable"' in page
-    assert OUTCOME_LINE.format("passed") in page
-    assert REASON_LINE.format("all green") in page
-
-
-def test_render_page_shows_multiline_reason_in_full(viewer, home):
-    reason = "line one\nline two"
-    page = viewer.render_page(3, viewer.LatestRun("failed", reason))
-    assert REASON_LINE.format(reason) in page
-
-
-def test_render_page_does_not_read_the_database_for_the_latest_run(
-    viewer, home, monkeypatch
-):
-    make_outcome_db(home, [("failed", "from the database")])
-
-    def forbidden_connect(*args, **kwargs):
-        raise AssertionError("render_page must not open the database")
-
-    monkeypatch.setattr(viewer.sqlite3, "connect", forbidden_connect)
-
-    page = viewer.render_page(1, viewer.LatestRun("passed", "given by the caller"))
-    assert OUTCOME_LINE.format("passed") in page
-    assert REASON_LINE.format("given by the caller") in page
-    assert "from the database" not in page
-
-
-def test_render_page_with_default_latest_ignores_runs_in_the_database(viewer, home):
-    make_outcome_db(home, [("failed", "from the database")])
-    assert viewer.latest_run() is not None
-    page = viewer.render_page(1)
-    assert "latest-run" not in page
-    assert "from the database" not in page
-
-
-# ---------------------------------------------------------- HTTP server, latest run
-
-
-def test_get_root_shows_outcome_and_reason_of_the_ended_latest_run(home, port):
-    make_outcome_db(home, [("failed", "old"), ("passed", "all green")])
-    status, _, body = fetch(port)
-    text = body.decode("utf-8")
-    assert status == 200
-    assert OUTCOME_LINE.format("passed") in text
-    assert REASON_LINE.format("all green") in text
-    assert '<strong id="run-count">2</strong>' in text
-    assert "old" not in text
-
-
-def test_get_root_body_is_the_page_rendered_from_count_and_latest_run(
-    viewer, home, port
-):
-    make_outcome_db(home, [("passed", "all green")])
-    _, _, body = fetch(port)
-    assert body.decode("utf-8") == viewer.render_page(
-        viewer.count_runs(), viewer.latest_run()
-    )
-    assert b"latest-run-outcome" in body
-
-
-def test_get_root_shows_not_ended_line_for_a_not_ended_latest_run(home, port):
-    make_outcome_db(home, [("passed", "all green"), (None, None)])
-    status, _, body = fetch(port)
-    text = body.decode("utf-8")
-    assert status == 200
-    assert NOT_ENDED_LINE in text
-    assert "latest-run-outcome" not in text
-    assert "latest-run-reason" not in text
-    assert "all green" not in text
-
-
-def test_get_root_shows_not_ended_line_for_latest_run_with_empty_strings(home, port):
-    make_outcome_db(home, [("", "")])
-    _, _, body = fetch(port)
-    text = body.decode("utf-8")
-    assert NOT_ENDED_LINE in text
-    assert "latest-run-outcome" not in text
-
-
-def test_get_root_omits_reason_when_ended_latest_run_has_no_reason(home, port):
-    make_outcome_db(home, [("passed", None)])
-    _, _, body = fetch(port)
-    text = body.decode("utf-8")
-    assert OUTCOME_LINE.format("passed") in text
-    assert "latest-run-reason" not in text
-
-
-def test_get_root_shows_outcome_once_the_latest_run_has_ended(home, port):
-    path = make_outcome_db(home, [(None, None)])
-    _, _, first = fetch(port)
-    assert NOT_ENDED_LINE in first.decode("utf-8")
-
-    execute_sql(path, "UPDATE runs SET outcome = 'failed', reason = 'tests red'")
-
-    status, _, second = fetch(port)
-    text = second.decode("utf-8")
-    assert status == 200
-    assert OUTCOME_LINE.format("failed") in text
-    assert REASON_LINE.format("tests red") in text
-    assert "latest-run-not-ended" not in text
-
-
-def test_get_root_shows_a_newer_run_inserted_while_serving(home, port):
-    path = make_outcome_db(home, [("passed", "all green")])
-    _, _, first = fetch(port)
-    assert OUTCOME_LINE.format("passed") in first.decode("utf-8")
-
-    insert_outcome_run(path, None, None)
-
-    _, _, second = fetch(port)
-    text = second.decode("utf-8")
-    assert NOT_ENDED_LINE in text
-    assert "latest-run-outcome" not in text
-    assert '<strong id="run-count">2</strong>' in text
-
-
-def test_get_root_escapes_html_in_outcome_and_reason(home, port):
-    make_outcome_db(home, [("<b>&", "<i>why</i>")])
-    _, _, body = fetch(port)
-    text = body.decode("utf-8")
-    assert OUTCOME_LINE.format("&lt;b&gt;&amp;") in text
-    assert REASON_LINE.format("&lt;i&gt;why&lt;/i&gt;") in text
-    assert "<b>" not in text
-    assert "<i>" not in text
-
-
-def test_get_root_content_length_matches_body_with_non_ascii_reason(home, port):
-    make_outcome_db(home, [("passed", "café ✓")])
-    _, headers, body = fetch(port)
-    assert REASON_LINE.format("café ✓") in body.decode("utf-8")
-    assert int(headers["Content-Length"]) == len(body)
-
-
-def test_get_root_without_database_has_no_latest_run(viewer, home, port):
-    status, _, body = fetch(port)
-    text = body.decode("utf-8")
-    assert status == 200
-    assert 'id="run-count-unavailable"' in text
-    assert "latest-run" not in text
-    assert text == viewer.render_page(viewer.count_runs(), viewer.latest_run())
-
-
-def test_get_root_with_empty_runs_table_has_no_latest_run(viewer, home, port):
-    make_outcome_db(home, [])
-    status, _, body = fetch(port)
-    text = body.decode("utf-8")
-    assert status == 200
-    assert '<strong id="run-count">0</strong>' in text
-    assert "latest-run" not in text
-    assert text == viewer.render_page(0, viewer.latest_run())
-
-
-def test_get_root_with_runs_lacking_outcome_columns_shows_count_and_no_latest_run(
-    viewer, home, port
-):
-    make_db(home, rows=3)
-    status, _, body = fetch(port)
-    text = body.decode("utf-8")
-    assert status == 200
-    assert text == viewer.render_page(3)
-    assert "latest-run" not in text
-    assert viewer.latest_run() is None
-
-
-def test_get_root_twice_returns_the_same_page_with_a_latest_run(home, port):
-    make_outcome_db(home, [("passed", "all green")])
-    first = fetch(port)
-    second = fetch(port)
-    assert first[0] == second[0] == 200
-    assert first[2] == second[2]
-    assert b'id="latest-run-outcome"' in first[2]
-
-
-def test_get_root_leaves_database_with_outcome_columns_unchanged(home, port):
-    path = make_outcome_db(home, [("passed", "all green"), (None, None)])
-    before = path.read_bytes()
-    _, _, body = fetch(port)
-    assert b'id="latest-run-not-ended"' in body
-    assert path.read_bytes() == before
-    assert [p.name for p in home.iterdir()] == ["factory.db"]
-
-
-def test_get_unknown_path_does_not_show_the_latest_run(viewer, home, port):
-    make_outcome_db(home, [("passed", "all green")])
-    assert viewer.latest_run() == viewer.LatestRun("passed", "all green")
-    status, _, body = fetch(port, "/latest")
-    assert status == 404
-    assert b"latest-run" not in body
