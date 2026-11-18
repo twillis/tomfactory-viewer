@@ -1,0 +1,7 @@
+# How the factory works on this codebase. Read from the commit a run starts at,
+# never from a run's checkout, so an agent cannot change what "passing" means.
+test_command = "python -m pytest -q -p no:cacheprovider"
+no_tests_exit_code = 5          # the test command's exit code for "no tests found"
+test_paths = ["tests/"]         # where tests live; only the test writer may change these
+docs_paths = ["docs/", "CHANGELOG.md"]   # where the documenter may write
+step_timeout_seconds = 900      # the time limit for any one step
