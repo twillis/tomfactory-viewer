@@ -58,7 +58,7 @@ The latest run is the row in `runs` with the highest `id`. The page reads its `o
 
   > Latest run unavailable: could not read outcome and reason from the runs table
 
-  In the missing-column case the count is still shown above this line.
+  In the missing-column case the count is still shown above this line. The wording is the same whatever the cause, so it also appears when the file is missing or the database is locked; the line above it tells you whether the count could be read.
 
 The run's id is not shown. Outcome and reason text is HTML-escaped.
 
@@ -74,11 +74,23 @@ The "Latest run unavailable" line appears below it, because the latest run canno
 
 The count appears on the next reload once the database is readable.
 
+### To see the unavailable line
+
+Make a database whose `runs` table has no `outcome` or `reason` column, and point the viewer at it:
+
+```
+mkdir /tmp/tf-demo
+python -c "import sqlite3; c = sqlite3.connect('/tmp/tf-demo/factory.db'); c.execute('CREATE TABLE runs (id INTEGER PRIMARY KEY)'); c.execute('INSERT INTO runs DEFAULT VALUES'); c.commit()"
+TOMFACTORY_HOME=/tmp/tf-demo python viewer.py
+```
+
+<http://127.0.0.1:8000/> shows "Runs recorded: 1" and then "Latest run unavailable: …". With `TOMFACTORY_HOME` set to an empty directory, it shows both unavailable lines.
+
 ## Limits
 
 - The server listens on `127.0.0.1` only, so it is reachable from the same machine and not from the network. There is no option to change the address.
 - Only `GET /` is served. Any other path returns 404.
-- Not tested: a database in WAL mode. SQLite may create `factory.db-shm` and `factory.db-wal` beside the database even for a read-only connection, or fail to open it if the directory is not writable; in the second case the page shows the "unavailable" message.
+- A database in WAL mode is tested only while another connection has it open. Not tested: a WAL database that nothing else has open, or one in a directory the viewer cannot write to. SQLite may create `factory.db-shm` and `factory.db-wal` beside the database even for a read-only connection, or fail to open it if the directory is not writable; in the second case the page shows the "unavailable" message.
 
 ## Tests
 
