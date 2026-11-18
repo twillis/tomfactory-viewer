@@ -1,14 +1,20 @@
-"""Hello-world observability page for the factory.
+"""Hello-world observability pages for the factory.
 
-Serves one page that says hello and shows how many runs the factory has
-recorded, plus the outcome and reason of the most recent run. Uses only the
+Serves two pages. The home page, at ``/``, says hello and shows how many runs
+the factory has recorded, plus the outcome and reason of the most recent run.
+The runs page, at ``/runs``, lists every run, newest first. Uses only the
 Python standard library.
+
+There are three layers: data (``read_*``), presentation (``render_*``) and HTTP
+(``_Handler``). The data layer hands the presentation layer one ``PageData`` or
+``RunsPageData``; the presentation layer never reads the database or the clock.
 """
 
 import argparse
 import html
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,6 +52,62 @@ class PageData(NamedTuple):
     latest: LatestRun | None | Unreadable  # None only when ``runs`` has no rows
 
 
+class RunSummary(NamedTuple):
+    """What the runs page knows about one run, and the rules that follow from it."""
+
+    id: int
+    state: str
+    outcome: str  # "" until the run has ended
+    request: str  # the full text
+    created_at: datetime | None  # UTC-aware; None if it could not be parsed
+    ended_at: datetime | None  # UTC-aware; None if absent or not parseable
+
+    @property
+    def ended(self) -> bool:
+        """Whether the run has ended: it has an outcome."""
+        return self.outcome != ""
+
+    @property
+    def status(self) -> str:
+        """The outcome once the run has ended, its state until then."""
+        return self.outcome if self.ended else self.state
+
+    def duration(self, now: datetime) -> timedelta | None:
+        """How long the run took, or has been running as of ``now``; None if unknown."""
+        if self.created_at is None:
+            return None
+        if self.ended:
+            if self.ended_at is None:
+                return None
+            span = self.ended_at - self.created_at
+        else:
+            span = now - self.created_at
+        return max(span, timedelta(0))
+
+
+class RunsPageData(NamedTuple):
+    """Everything the runs page shows: the data layer's hand-off to presentation."""
+
+    runs: tuple[RunSummary, ...] | Unreadable  # in the order to show them
+    read_at: datetime  # UTC-aware; when the read was made
+
+
+def _connect() -> sqlite3.Connection:
+    """Open the factory database read-only, so it is never created or changed."""
+    return sqlite3.connect(db_path().resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def _parse_time(value) -> datetime | None:
+    """Return the UTC-aware time a stored timestamp names, or None if it names none."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc)
+
+
 def read_page_data() -> PageData:
     """Read everything the page shows, over one read-only connection.
 
@@ -55,7 +117,7 @@ def read_page_data() -> PageData:
     ``runs`` table was read and has no rows.
     """
     try:
-        conn = sqlite3.connect(db_path().resolve().as_uri() + "?mode=ro", uri=True)
+        conn = _connect()
     except sqlite3.Error:
         return PageData(UNREADABLE, UNREADABLE)
     try:
@@ -82,6 +144,57 @@ def read_page_data() -> PageData:
         return PageData(count, latest)
     finally:
         conn.close()
+
+
+def read_runs_page_data() -> RunsPageData:
+    """Read every run, highest id first, over one read-only connection.
+
+    One statement is run, so the rows describe one moment. If the database, the
+    ``runs`` table or any column the page needs could not be read, ``runs`` is
+    ``UNREADABLE``; an empty table gives an empty tuple.
+    """
+    read_at = datetime.now(timezone.utc)
+    try:
+        conn = _connect()
+    except sqlite3.Error:
+        return RunsPageData(UNREADABLE, read_at)
+    try:
+        rows = conn.execute(
+            "SELECT id, state, outcome, request, created_at, ended_at "
+            "FROM runs ORDER BY id DESC"
+        ).fetchall()
+    except sqlite3.Error:
+        return RunsPageData(UNREADABLE, read_at)
+    finally:
+        conn.close()
+    runs = tuple(
+        RunSummary(
+            row[0],
+            row[1] or "",
+            row[2] or "",
+            row[3] or "",
+            _parse_time(row[4]),
+            _parse_time(row[5]),
+        )
+        for row in rows
+    )
+    return RunsPageData(runs, read_at)
+
+
+def _document(title: str, body: str) -> str:
+    """Return a full HTML document; ``body`` is lines each ending in a newline."""
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        f"<title>{title}</title>\n"
+        "</head>\n"
+        "<body>\n"
+        f"{body}"
+        "</body>\n"
+        "</html>\n"
+    )
 
 
 def _render_latest(latest: LatestRun | None | Unreadable) -> str:
@@ -117,28 +230,98 @@ def render_page(data: PageData) -> str:
         )
     else:
         status = f'<p>Runs recorded: <strong id="run-count">{count}</strong></p>'
-    return (
-        "<!doctype html>\n"
-        '<html lang="en">\n'
-        "<head>\n"
-        '<meta charset="utf-8">\n'
-        "<title>tomfactory viewer</title>\n"
-        "</head>\n"
-        "<body>\n"
+    return _document(
+        "tomfactory viewer",
         "<h1>Hello from the factory</h1>\n"
+        '<p><a id="runs-link" href="/runs">All runs</a></p>\n'
         f"{status}\n"
-        f"{_render_latest(latest)}"
-        "</body>\n"
-        "</html>\n"
+        f"{_render_latest(latest)}",
     )
+
+
+REQUEST_WORDS = 10  # how many words of a request the runs page shows
+
+
+def _first_words(text: str) -> str:
+    """Return the first ``REQUEST_WORDS`` words of ``text``, with … if there were more."""
+    words = text.split()
+    shown = " ".join(words[:REQUEST_WORDS])
+    return shown + "…" if len(words) > REQUEST_WORDS else shown
+
+
+def _format_time(dt: datetime | None) -> str:
+    return "unknown" if dt is None else dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _format_duration(td: timedelta | None) -> str:
+    """Return whole seconds as e.g. ``42s``, ``3m 7s``, ``2h 0m 7s`` or ``1d 0h 3m 7s``."""
+    if td is None:
+        return "unknown"
+    minutes, seconds = divmod(max(int(td.total_seconds()), 0), 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    parts = [(days, "d"), (hours, "h"), (minutes, "m"), (seconds, "s")]
+    while len(parts) > 1 and parts[0][0] == 0:
+        parts.pop(0)
+    return " ".join(f"{amount}{unit}" for amount, unit in parts)
+
+
+def _render_run_row(run: RunSummary, read_at: datetime) -> str:
+    """Return the table line for one run, ending in a newline."""
+    span = run.duration(read_at)
+    duration = _format_duration(span)
+    if span is not None and not run.ended:
+        duration += " so far"
+    return (
+        f'<tr id="run-{run.id}">'
+        f'<td class="run-id">{run.id}</td>'
+        f'<td class="run-status">{html.escape(run.status)}</td>'
+        f'<td class="run-request">{html.escape(_first_words(run.request))}</td>'
+        f'<td class="run-created">{_format_time(run.created_at)}</td>'
+        f'<td class="run-duration">{duration}</td>'
+        "</tr>\n"
+    )
+
+
+def render_runs_page(data: RunsPageData) -> str:
+    """Return the full HTML runs page for the given data, rows in the order given."""
+    runs, read_at = data
+    if runs is UNREADABLE:
+        listing = (
+            '<p id="runs-unavailable">Runs unavailable: '
+            "could not read the runs table</p>\n"
+        )
+    elif not runs:
+        listing = '<p id="no-runs">No runs recorded yet</p>\n'
+    else:
+        listing = (
+            '<table id="runs">\n'
+            "<thead>\n"
+            "<tr><th>Id</th><th>Status</th><th>Request</th><th>Created</th>"
+            "<th>Duration</th></tr>\n"
+            "</thead>\n"
+            "<tbody>\n"
+            + "".join(_render_run_row(run, read_at) for run in runs)
+            + "</tbody>\n"
+            "</table>\n"
+        )
+    return _document("Runs - tomfactory viewer", "<h1>Runs</h1>\n" + listing)
+
+
+# Every path served, and how its page is made. Any other path is a 404.
+_PAGES = {
+    "/": lambda: render_page(read_page_data()),
+    "/runs": lambda: render_runs_page(read_runs_page_data()),
+}
 
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path.split("?", 1)[0] != "/":
+        page = _PAGES.get(self.path.split("?", 1)[0])
+        if page is None:
             self.send_error(404)
             return
-        body = render_page(read_page_data()).encode("utf-8")
+        body = page().encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
