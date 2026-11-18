@@ -107,7 +107,21 @@ CREATE INDEX steps_by_run  ON steps  (run_id, id);
 
 A column typed `JSON TEXT` holds JSON text; the gateway hands it back parsed. A column typed `BOOLEAN` holds 1 or 0; the gateway hands it back as true or false. To any other reader they are text and a number.
 
-All timestamps are UTC in ISO 8601 form, for example `2026-11-18T21:04:05Z`.
+All timestamps are UTC in ISO 8601 form **with milliseconds**, for example `2026-11-18T21:04:05.123Z`. *(Corrected 2026-11-18: this line first gave an example without milliseconds, and a viewer built from it could not read the real values.)*
+
+### What the JSON columns hold
+
+*(Added 2026-11-18, after a planner building the viewer had to stop and ask.)*
+
+| Column | Shape | Example |
+|--------|-------|---------|
+| `steps.checks` | A list, in the order the checks ran. Each item is an object with `name` (text), `passed` (true or false), `note` (text; why it failed, or test output; often empty when it passed) and `timed_out` (true or false). A check failed when `passed` is false. Empty (`NULL`) until the step finishes. | `[{"name": "tests_pass", "passed": false, "note": "1 failed…", "timed_out": false}]` |
+| `steps.produced` | An object. For an agent step, the envelope it replied with, whose keys depend on the step (see the workflow contract); if it gave none, `{"text": "…"}`. For a code step that ran a command, `{"output": "…"}`; otherwise `{}`. `NULL` until the step finishes. | `{"summary": "added greet", "files_changed": ["hello.py"]}` |
+| `steps.tokens` | An object with `input` and `output` (numbers), for agent steps; `NULL` for code steps. | `{"input": 25416, "output": 2935}` |
+| `plans.ideals_addressed`, `plans.conflicts` | Lists of text. | `["keeps the layers apart"]` |
+| `events.payload` | An object whose keys depend on the event's kind. A reader should show `summary` and treat the payload as detail. | `{"name": "tests_pass", "passed": true, "note": "", "timed_out": false}` |
+
+`steps.passed` is `1`, `0`, or `NULL` while the step is running. `steps.failure` is `NULL` when it passed.
 
 ## Rows
 
