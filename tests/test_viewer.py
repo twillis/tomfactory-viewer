@@ -3,6 +3,7 @@
 import ast
 import html
 import importlib
+import json
 import re
 import sqlite3
 import sys
@@ -1778,7 +1779,7 @@ def run_row(run_id, status, request, created=CREATED_TEXT, duration="3m 7s"):
     """The table line the /runs page shows for one run; the texts are already escaped."""
     return (
         f'<tr id="run-{run_id}">'
-        f'<td class="run-id">{run_id}</td>'
+        f'<td class="run-id"><a href="/runs/{run_id}">{run_id}</a></td>'
         f'<td class="run-status">{status}</td>'
         f'<td class="run-request">{request}</td>'
         f'<td class="run-created">{created}</td>'
@@ -2241,7 +2242,6 @@ MALFORMED_TIMES = [
     pytest.param("2026-11-18 21:04:05", id="space_and_no_z"),
     pytest.param("2026-11-18T21:04:05", id="no_z"),
     pytest.param("2026-11-18T21:04:05+00:00", id="numeric_offset"),
-    pytest.param("2026-11-18T21:04:05.250Z", id="fractional_seconds"),
     pytest.param("2026-13-45T99:99:99Z", id="impossible_date"),
     pytest.param("2026-11-18", id="date_only"),
     pytest.param("1763500000", id="epoch_seconds"),
@@ -2274,6 +2274,56 @@ def test_read_runs_page_data_keeps_other_runs_when_one_has_a_malformed_time(
     runs = viewer.read_runs_page_data().runs
     assert [run.id for run in runs] == [3, 2, 1]
     assert [run.created_at for run in runs] == [CREATED_DT, None, CREATED_DT]
+
+
+# The second form the factory stores: the same time with a fraction of a second.
+FRACTIONAL_TIMES = [
+    pytest.param("2026-11-18T21:04:05.250Z", 250000, id="a_quarter_second"),
+    pytest.param("2026-11-18T21:04:05.123Z", 123000, id="milliseconds"),
+    pytest.param("2026-11-18T21:04:05.000Z", 0, id="zero_milliseconds"),
+]
+
+
+@pytest.mark.parametrize("stored, microsecond", FRACTIONAL_TIMES)
+def test_read_runs_page_data_parses_created_at_keeping_the_fraction_of(
+    viewer, home, stored, microsecond
+):
+    make_runs_db(home, [{"request": "Fraction", "created_at": stored}])
+    (run,) = viewer.read_runs_page_data().runs
+    assert run.created_at == CREATED_DT.replace(microsecond=microsecond)
+    assert run.created_at.utcoffset() == timedelta(0)
+    assert run.ended_at == ENDED_DT
+
+
+@pytest.mark.parametrize("stored, microsecond", FRACTIONAL_TIMES)
+def test_read_runs_page_data_parses_ended_at_keeping_the_fraction_of(
+    viewer, home, stored, microsecond
+):
+    make_runs_db(home, [{"request": "Fraction", "ended_at": stored}])
+    (run,) = viewer.read_runs_page_data().runs
+    assert run.ended_at == CREATED_DT.replace(microsecond=microsecond)
+    assert run.ended_at.utcoffset() == timedelta(0)
+    assert run.created_at == CREATED_DT
+
+
+def test_get_runs_shows_created_and_duration_of_a_run_stored_with_milliseconds(
+    home, port
+):
+    make_runs_db(
+        home,
+        [
+            {
+                "created_at": "2026-11-18T21:04:05.123Z",
+                "ended_at": "2026-11-18T21:07:12.623Z",
+            }
+        ],
+    )
+    status, _, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert '<td class="run-created">2026-11-18 21:04:05 UTC</td>' in text
+    assert duration_cell("3m 7s") in text
+    assert "unknown" not in text
 
 
 # ------------------------------------------------ read_runs_page_data: empty table
@@ -3124,7 +3174,7 @@ def test_get_runs_shows_a_running_run_with_its_state_and_duration_so_far(home, p
     text = body.decode("utf-8")
     assert status == 200
     assert re.search(
-        r'<tr id="run-2"><td class="run-id">2</td>'
+        r'<tr id="run-2"><td class="run-id"><a href="/runs/2">2</a></td>'
         r'<td class="run-status">working</td>'
         r'<td class="run-request">Still going</td>'
         r'<td class="run-created">2020-01-01 00:00:00 UTC</td>'
@@ -3151,7 +3201,7 @@ def test_get_runs_ignores_the_query_string(home, port):
 
 
 @pytest.mark.parametrize(
-    "path", ["/runs/", "/runs/7", "/runs.html", "/run", "/Runs", "/runs/?x=1"]
+    "path", ["/runs/", "/runs.html", "/run", "/Runs", "/runs/?x=1"]
 )
 def test_get_runs_is_served_only_at_exactly_runs_not_at(home, port, path):
     make_runs_db(home, [{"run_id": 7}])
@@ -3333,3 +3383,3243 @@ def test_the_runs_link_on_the_home_page_leads_to_the_runs_page(home, port):
     status, _, runs_body = fetch(port, match.group(1))
     assert status == 200
     assert 'id="run-7"' in runs_body.decode("utf-8")
+
+
+# ====================================================================================
+# The /runs/<id> page: one run and its steps
+# ====================================================================================
+
+# ------------------------------------------------------- helpers for /runs/<id> tests
+
+# The ``steps`` table and its index, exactly as docs/run-store.md gives them.
+STEPS_DDL = """
+CREATE TABLE steps (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         INTEGER NOT NULL REFERENCES runs(id),
+    name           TEXT    NOT NULL,
+    kind           TEXT    NOT NULL CHECK (kind IN ('agent','code')),
+    persona        TEXT,
+    attempt        INTEGER NOT NULL,
+    asked          TEXT    NOT NULL,
+    produced       JSON TEXT,
+    checks         JSON TEXT,
+    passed         BOOLEAN,
+    failure        TEXT    CHECK (failure IN ('timeout','error','guard','malformed','check')),
+    started_at     TEXT    NOT NULL,
+    ended_at       TEXT,
+    tokens         JSON TEXT,
+    cost_estimate  REAL
+);
+CREATE INDEX steps_by_run  ON steps  (run_id, id);
+"""
+
+RUN_REQUEST = "Add a page for one run"
+RUN_TARGET = "/path/to/target"
+RUN_BRANCH = "factory/7-add-a-page"
+RUN_REASON = "all checks passed"
+
+# Keyword arguments for ``insert_step`` that make the step one that has not finished.
+UNFINISHED = {"passed": None, "ended_at": None, "checks": None}
+
+
+def checks_json(*checks):
+    """The JSON the factory stores for checks given as ``(name, passed)`` pairs."""
+    return json.dumps(
+        [
+            {"name": name, "passed": passed, "note": "", "timed_out": False}
+            for name, passed in checks
+        ]
+    )
+
+
+def insert_detail_run(
+    path,
+    run_id=7,
+    request=RUN_REQUEST,
+    target=RUN_TARGET,
+    branch=RUN_BRANCH,
+    state="ended",
+    outcome="accepted",
+    reason=RUN_REASON,
+    attempt_limit=3,
+    created_at=CREATED,
+    ended_at=ENDED,
+):
+    """Insert one run, every column the run page reads given; ended by default."""
+    execute_sql(
+        path,
+        "INSERT INTO runs (id, request, target, base_commit, branch, state, outcome, "
+        "reason, attempt_limit, created_at, ended_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            run_id,
+            request,
+            target,
+            "abc123",
+            branch,
+            state,
+            outcome,
+            reason,
+            attempt_limit,
+            created_at,
+            ended_at,
+        ),
+    )
+
+
+def insert_step(
+    path,
+    run_id=7,
+    step_id=None,
+    name="test",
+    kind="agent",
+    persona="tester",
+    attempt=1,
+    checks=None,
+    passed=1,
+    started_at=CREATED,
+    ended_at=ENDED,
+):
+    """Insert one row into a ``steps`` table; finished and passed by default."""
+    execute_sql(
+        path,
+        "INSERT INTO steps (id, run_id, name, kind, persona, attempt, asked, checks, "
+        "passed, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            step_id,
+            run_id,
+            name,
+            kind,
+            persona,
+            attempt,
+            "do the work",
+            checks,
+            passed,
+            started_at,
+            ended_at,
+        ),
+    )
+
+
+def make_run_db(home, runs=(), steps=()):
+    """Create ``home/factory.db`` with the documented ``runs`` and ``steps`` tables.
+
+    ``runs`` and ``steps`` are sequences of keyword-argument mappings for
+    ``insert_detail_run`` and ``insert_step``, inserted in order.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "factory.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(RUNS_DDL + STEPS_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+    for run in runs:
+        insert_detail_run(path, **run)
+    for step in steps:
+        insert_step(path, **step)
+    return path
+
+
+def run_detail(
+    viewer,
+    run_id=7,
+    state="ended",
+    outcome="accepted",
+    request=RUN_REQUEST,
+    created_at=CREATED_DT,
+    ended_at=ENDED_DT,
+    target=RUN_TARGET,
+    branch=RUN_BRANCH,
+    reason=RUN_REASON,
+    attempt_limit=3,
+):
+    """A hand-built ``RunDetail``; an ended, accepted run by default."""
+    return viewer.RunDetail(
+        viewer.RunSummary(run_id, state, outcome, request, created_at, ended_at),
+        target,
+        branch,
+        reason,
+        attempt_limit,
+    )
+
+
+def running_detail(viewer, state="working", reason="", **kwargs):
+    return run_detail(
+        viewer, state=state, outcome="", ended_at=None, reason=reason, **kwargs
+    )
+
+
+def step_summary(
+    viewer,
+    step_id=12,
+    name="test",
+    persona="tester",
+    attempt=1,
+    started_at=CREATED_DT,
+    ended_at=ENDED_DT,
+    passed=True,
+    checks=(),
+):
+    """A hand-built ``StepSummary``; finished and passed by default."""
+    return viewer.StepSummary(
+        step_id, name, persona, attempt, started_at, ended_at, passed, checks
+    )
+
+
+def unfinished_step(viewer, **kwargs):
+    return step_summary(viewer, passed=None, ended_at=None, **kwargs)
+
+
+def render_run(viewer, run, steps=(), read_at=ENDED_DT, run_id=7):
+    """Render the run page for a hand-built run, steps and a fixed read time."""
+    if not isinstance(steps, viewer.Unreadable):
+        steps = tuple(steps)
+    return viewer.render_run_page(viewer.RunPageData(run_id, run, steps, read_at))
+
+
+def run_head(title, heading):
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        f"<title>{title}</title>\n"
+        "</head>\n"
+        "<body>\n"
+        f"<h1>{heading}</h1>\n"
+    )
+
+
+RUN_7_HEAD = run_head("Run 7 - tomfactory viewer", "Run 7")
+RUN_NOT_FOUND_HEAD = run_head("Run not found - tomfactory viewer", "Run not found")
+RUN_UNAVAILABLE_LINE = (
+    '<p id="run-unavailable">Run unavailable: could not read the runs table</p>\n'
+)
+STEPS_UNAVAILABLE_LINE = (
+    '<p id="steps-unavailable">Steps unavailable: could not read the steps table</p>\n'
+)
+NO_STEPS_LINE = '<p id="no-steps">No steps recorded yet</p>\n'
+STEPS_TABLE_OPEN = (
+    '<table id="steps">\n'
+    "<thead>\n"
+    "<tr><th>Name</th><th>Persona</th><th>Attempt</th><th>Duration</th>"
+    "<th>Result</th><th>Checks</th></tr>\n"
+    "</thead>\n"
+    "<tbody>\n"
+)
+STEPS_TABLE_CLOSE = "</tbody>\n</table>\n"
+
+
+def run_not_found_line(run_id):
+    return f'<p id="run-not-found">No run with id {run_id}</p>\n'
+
+
+def run_facts(
+    request=RUN_REQUEST,
+    target=RUN_TARGET,
+    branch=RUN_BRANCH,
+    label="Outcome",
+    status="accepted",
+    reason=RUN_REASON,
+    attempt_limit=3,
+):
+    """The lines describing the run; texts already escaped. ``reason=None``: no line."""
+    reason_line = (
+        "" if reason is None else f'<dt>Reason</dt><dd id="run-reason">{reason}</dd>\n'
+    )
+    return (
+        '<dl id="run">\n'
+        f'<dt>Request</dt><dd id="run-request">{request}</dd>\n'
+        f'<dt>Target</dt><dd id="run-target">{target}</dd>\n'
+        f'<dt>Branch</dt><dd id="run-branch">{branch}</dd>\n'
+        f'<dt>{label}</dt><dd id="run-status">{status}</dd>\n'
+        + reason_line
+        + f'<dt>Attempt limit</dt><dd id="run-attempt-limit">{attempt_limit}</dd>\n'
+        "</dl>\n"
+    )
+
+
+def step_row(
+    step_id,
+    name="test",
+    persona="tester",
+    attempt=1,
+    duration="3m 7s",
+    result="passed",
+    checks="",
+):
+    """The table line the run page shows for one step; the texts are already escaped."""
+    return (
+        f'<tr id="step-{step_id}">'
+        f'<td class="step-name">{name}</td>'
+        f'<td class="step-persona">{persona}</td>'
+        f'<td class="step-attempt">{attempt}</td>'
+        f'<td class="step-duration">{duration}</td>'
+        f'<td class="step-result">{result}</td>'
+        f'<td class="step-checks">{checks}</td>'
+        "</tr>\n"
+    )
+
+
+def check_span(name):
+    return f'<span class="check">{name}</span>'
+
+
+def failed_check_span(name):
+    return f'<span class="check check-failed">{name} (failed)</span>'
+
+
+def step_duration_cell(text):
+    return f'<td class="step-duration">{text}</td>'
+
+
+def step_checks_cell(text):
+    return f'<td class="step-checks">{text}</td>'
+
+
+def _make_runs_table_without_target(home):
+    path = make_db(home, with_runs_table=False)
+    execute_sql(
+        path,
+        "CREATE TABLE runs (id INTEGER PRIMARY KEY, state TEXT, outcome TEXT, "
+        "request TEXT, created_at TEXT, ended_at TEXT, branch TEXT, reason TEXT, "
+        "attempt_limit INTEGER)",
+    )
+    execute_sql(
+        path,
+        "INSERT INTO runs (id, state, outcome, request, created_at, ended_at, "
+        "attempt_limit) VALUES (7, 'ended', 'accepted', 'Fix the bug', ?, ?, 3)",
+        (CREATED, ENDED),
+    )
+
+
+def _make_runs_table_without_attempt_limit(home):
+    path = make_db(home, with_runs_table=False)
+    execute_sql(
+        path,
+        "CREATE TABLE runs (id INTEGER PRIMARY KEY, state TEXT, outcome TEXT, "
+        "request TEXT, created_at TEXT, ended_at TEXT, target TEXT, branch TEXT, "
+        "reason TEXT)",
+    )
+    execute_sql(
+        path,
+        "INSERT INTO runs (id, state, outcome, request, created_at, ended_at, target) "
+        "VALUES (7, 'ended', 'accepted', 'Fix the bug', ?, ?, '/tmp/target')",
+        (CREATED, ENDED),
+    )
+
+
+# Ways for the run itself to be unreadable. Each takes the home directory.
+UNREADABLE_RUN_DATABASES = UNREADABLE_RUNS_DATABASES + [
+    pytest.param(_make_runs_table_without_target, id="runs_has_no_target_column"),
+    pytest.param(
+        _make_runs_table_without_attempt_limit, id="runs_has_no_attempt_limit_column"
+    ),
+]
+
+
+def _make_run_without_steps_table(home):
+    path = make_runs_db(home)
+    insert_detail_run(path)
+
+
+LOOSE_STEP_COLUMNS = {
+    "name": "TEXT",
+    "persona": "TEXT",
+    "attempt": "INTEGER",
+    "started_at": "TEXT",
+    "ended_at": "TEXT",
+    "passed": "BOOLEAN",
+    "checks": "TEXT",
+}
+
+
+def _make_steps_table_without(column):
+    def make(home):
+        path = make_runs_db(home)
+        insert_detail_run(path)
+        columns = ", ".join(
+            f"{name} {kind}"
+            for name, kind in LOOSE_STEP_COLUMNS.items()
+            if name != column
+        )
+        execute_sql(
+            path,
+            f"CREATE TABLE steps (id INTEGER PRIMARY KEY, run_id INTEGER, {columns})",
+        )
+        execute_sql(path, "INSERT INTO steps (run_id) VALUES (7)")
+
+    return make
+
+
+# Ways for the steps to be unreadable while run 7 itself can be read.
+UNREADABLE_STEPS_DATABASES = [
+    pytest.param(_make_run_without_steps_table, id="steps_table_is_missing"),
+    pytest.param(_make_steps_table_without("checks"), id="steps_has_no_checks_column"),
+    pytest.param(
+        _make_steps_table_without("persona"), id="steps_has_no_persona_column"
+    ),
+    pytest.param(_make_steps_table_without("passed"), id="steps_has_no_passed_column"),
+    pytest.param(
+        _make_steps_table_without("started_at"), id="steps_has_no_started_at_column"
+    ),
+]
+
+
+def fail_statements_on_steps(sql):
+    """An ``after_execute`` hook for ``wrap_connections``: reading ``steps`` fails."""
+    if "steps" in sql.lower():
+        raise sqlite3.OperationalError("database is locked")
+
+
+# ----------------------------------------------------------- the run page's value types
+
+
+def test_check_has_name_and_passed_fields_in_that_order(viewer):
+    check = viewer.Check("tests", False)
+    assert viewer.Check._fields == ("name", "passed")
+    assert check.name == "tests"
+    assert check.passed is False
+
+
+def test_step_summary_has_its_eight_fields_in_order(viewer):
+    assert viewer.StepSummary._fields == (
+        "id",
+        "name",
+        "persona",
+        "attempt",
+        "started_at",
+        "ended_at",
+        "passed",
+        "checks",
+    )
+
+
+def test_step_summary_keeps_the_values_it_is_given(viewer):
+    checks = (viewer.Check("guard", True),)
+    step = viewer.StepSummary(
+        12, "test", "tester", 2, CREATED_DT, ENDED_DT, False, checks
+    )
+    assert step.id == 12
+    assert step.name == "test"
+    assert step.persona == "tester"
+    assert step.attempt == 2
+    assert step.started_at == CREATED_DT
+    assert step.ended_at == ENDED_DT
+    assert step.passed is False
+    assert step.checks == checks
+
+
+def test_run_detail_has_summary_target_branch_reason_and_attempt_limit_in_order(
+    viewer,
+):
+    summary = viewer.RunSummary(7, "ended", "accepted", "Fix", CREATED_DT, ENDED_DT)
+    detail = viewer.RunDetail(summary, "/tmp/target", "factory/7-fix", "done", 3)
+    assert viewer.RunDetail._fields == (
+        "summary",
+        "target",
+        "branch",
+        "reason",
+        "attempt_limit",
+    )
+    assert detail.summary is summary
+    assert detail.target == "/tmp/target"
+    assert detail.branch == "factory/7-fix"
+    assert detail.reason == "done"
+    assert detail.attempt_limit == 3
+
+
+def test_run_detail_states_ended_and_status_through_its_run_summary(viewer):
+    assert run_detail(viewer, outcome="rejected").summary.ended is True
+    assert run_detail(viewer, outcome="rejected").summary.status == "rejected"
+    assert running_detail(viewer, state="planning").summary.ended is False
+    assert running_detail(viewer, state="planning").summary.status == "planning"
+
+
+def test_run_page_data_has_run_id_run_steps_and_read_at_fields_in_that_order(viewer):
+    data = viewer.RunPageData(99, None, (), CREATED_DT)
+    assert viewer.RunPageData._fields == ("run_id", "run", "steps", "read_at")
+    assert data.run_id == 99
+    assert data.run is None
+    assert data.steps == ()
+    assert data.read_at == CREATED_DT
+
+
+def test_run_page_data_requires_read_at_to_be_given(viewer):
+    run_page_data = viewer.RunPageData
+    with pytest.raises(TypeError):
+        run_page_data(7, None, ())
+
+
+# ----------------------------------------------------------- StepSummary: finished
+
+
+def test_step_summary_that_passed_has_finished(viewer):
+    assert step_summary(viewer, passed=True).finished is True
+
+
+def test_step_summary_that_failed_has_finished(viewer):
+    assert step_summary(viewer, passed=False).finished is True
+
+
+def test_step_summary_with_no_result_has_not_finished(viewer):
+    assert unfinished_step(viewer).finished is False
+
+
+def test_step_summary_finished_is_decided_by_passed_not_by_ended_at(viewer):
+    result_without_end = step_summary(viewer, passed=False, ended_at=None)
+    assert result_without_end.finished is True
+
+    end_without_result = step_summary(viewer, passed=None, ended_at=ENDED_DT)
+    assert end_without_result.finished is False
+
+
+# ----------------------------------------------------------- StepSummary: duration
+
+
+def test_step_summary_duration_of_a_finished_step_is_from_started_to_ended(viewer):
+    step = step_summary(viewer)
+    assert step.duration(ENDED_DT) == timedelta(seconds=187)
+
+
+def test_step_summary_duration_of_a_failed_step_is_from_started_to_ended(viewer):
+    step = step_summary(viewer, passed=False)
+    assert step.duration(ENDED_DT) == timedelta(seconds=187)
+
+
+def test_step_summary_duration_of_a_finished_step_ignores_now(viewer):
+    step = step_summary(viewer)
+    assert step.duration(ENDED_DT + timedelta(days=400)) == timedelta(seconds=187)
+    assert step.duration(CREATED_DT - timedelta(days=1)) == timedelta(seconds=187)
+
+
+def test_step_summary_duration_of_an_unfinished_step_is_from_started_to_now(viewer):
+    step = unfinished_step(viewer)
+    assert step.duration(CREATED_DT + timedelta(hours=2, seconds=7)) == timedelta(
+        hours=2, seconds=7
+    )
+
+
+def test_step_summary_duration_of_an_unfinished_step_grows_with_now(viewer):
+    step = unfinished_step(viewer)
+    earlier = step.duration(CREATED_DT + timedelta(seconds=10))
+    later = step.duration(CREATED_DT + timedelta(seconds=11))
+    assert later - earlier == timedelta(seconds=1)
+
+
+def test_step_summary_duration_of_an_unfinished_step_ignores_a_stray_ended_at(viewer):
+    step = step_summary(viewer, passed=None, ended_at=ENDED_DT)
+    assert step.duration(CREATED_DT + timedelta(seconds=5)) == timedelta(seconds=5)
+
+
+def test_step_summary_duration_keeps_fractions_of_a_second(viewer):
+    step = step_summary(
+        viewer,
+        started_at=CREATED_DT.replace(microsecond=123000),
+        ended_at=ENDED_DT.replace(microsecond=623000),
+    )
+    assert step.duration(ENDED_DT) == timedelta(seconds=187, milliseconds=500)
+
+
+def test_step_summary_duration_is_none_for_a_finished_step_without_started_at(viewer):
+    step = step_summary(viewer, started_at=None)
+    assert step.duration(ENDED_DT) is None
+
+
+def test_step_summary_duration_is_none_for_an_unfinished_step_without_started_at(
+    viewer,
+):
+    step = unfinished_step(viewer, started_at=None)
+    assert step.duration(ENDED_DT) is None
+
+
+def test_step_summary_duration_is_none_for_a_finished_step_without_ended_at(viewer):
+    step = step_summary(viewer, ended_at=None)
+    assert step.duration(ENDED_DT + timedelta(days=1)) is None
+
+
+def test_step_summary_duration_is_none_when_both_times_are_missing(viewer):
+    step = step_summary(viewer, started_at=None, ended_at=None)
+    assert step.duration(ENDED_DT) is None
+
+
+def test_step_summary_duration_is_zero_when_a_step_ended_before_it_started(viewer):
+    step = step_summary(viewer, ended_at=CREATED_DT - timedelta(seconds=30))
+    assert step.duration(ENDED_DT) == timedelta(0)
+
+
+def test_step_summary_duration_is_zero_when_now_is_before_an_unfinished_step_started(
+    viewer,
+):
+    step = unfinished_step(viewer)
+    assert step.duration(CREATED_DT - timedelta(seconds=30)) == timedelta(0)
+
+
+def test_step_summary_duration_is_zero_when_a_step_ended_the_moment_it_started(viewer):
+    step = step_summary(viewer, ended_at=CREATED_DT)
+    assert step.duration(ENDED_DT) == timedelta(0)
+
+
+# ----------------------------------------------------- read_run_page_data: the run
+
+
+def test_read_run_page_data_returns_a_run_page_data(viewer, home):
+    make_run_db(home, runs=[{}])
+    assert isinstance(viewer.read_run_page_data(7), viewer.RunPageData)
+
+
+def test_read_run_page_data_maps_every_field_of_a_run_and_its_steps(viewer, home):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {
+                "step_id": 11,
+                "name": "red",
+                "persona": "test-writer",
+                "attempt": 1,
+                "passed": 1,
+                "checks": checks_json(("guard", True)),
+            },
+            {
+                "step_id": 12,
+                "name": "test",
+                "persona": "tester",
+                "attempt": 2,
+                "passed": 0,
+                "checks": checks_json(("guard", True), ("tests", False)),
+            },
+        ],
+    )
+    data = viewer.read_run_page_data(7)
+    assert data.run_id == 7
+    assert data.run == viewer.RunDetail(
+        viewer.RunSummary(7, "ended", "accepted", RUN_REQUEST, CREATED_DT, ENDED_DT),
+        RUN_TARGET,
+        RUN_BRANCH,
+        RUN_REASON,
+        3,
+    )
+    assert data.steps == (
+        viewer.StepSummary(
+            11,
+            "red",
+            "test-writer",
+            1,
+            CREATED_DT,
+            ENDED_DT,
+            True,
+            (viewer.Check("guard", True),),
+        ),
+        viewer.StepSummary(
+            12,
+            "test",
+            "tester",
+            2,
+            CREATED_DT,
+            ENDED_DT,
+            False,
+            (viewer.Check("guard", True), viewer.Check("tests", False)),
+        ),
+    )
+
+
+def test_read_run_page_data_run_is_a_run_detail_holding_a_run_summary(viewer, home):
+    make_run_db(home, runs=[{}])
+    run = viewer.read_run_page_data(7).run
+    assert isinstance(run, viewer.RunDetail)
+    assert isinstance(run.summary, viewer.RunSummary)
+    assert type(run.summary.id) is int
+    assert type(run.attempt_limit) is int
+
+
+def test_read_run_page_data_returns_the_run_with_the_id_asked_for(viewer, home):
+    make_run_db(
+        home,
+        runs=[
+            {"run_id": 6, "request": "the one before"},
+            {"run_id": 7, "request": "the one asked for"},
+            {"run_id": 8, "request": "the one after"},
+        ],
+    )
+    data = viewer.read_run_page_data(7)
+    assert data.run.summary.id == 7
+    assert data.run.summary.request == "the one asked for"
+    assert viewer.read_run_page_data(8).run.summary.request == "the one after"
+    assert viewer.read_run_page_data(6).run.summary.request == "the one before"
+
+
+def test_read_run_page_data_run_id_is_the_id_asked_for(viewer, home):
+    make_run_db(home, runs=[{"run_id": 3}])
+    assert viewer.read_run_page_data(3).run_id == 3
+    assert viewer.read_run_page_data(99).run_id == 99
+
+
+def test_read_run_page_data_gives_a_running_run_empty_outcome_and_no_ended_at(
+    viewer, home
+):
+    make_run_db(home, runs=[{"reason": None, **RUNNING}])
+    run = viewer.read_run_page_data(7).run
+    assert run == running_detail(viewer)
+    assert run.summary.outcome == ""
+    assert run.summary.ended_at is None
+    assert run.summary.ended is False
+
+
+@pytest.mark.parametrize("state", ["planning", "awaiting_approval", "working"])
+def test_read_run_page_data_returns_the_stored_state_of_a_run_that_has_not_ended(
+    viewer, home, state
+):
+    make_run_db(home, runs=[{"state": state, "outcome": None, "ended_at": None}])
+    run = viewer.read_run_page_data(7).run
+    assert run.summary.state == state
+    assert run.summary.status == state
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "rejected", "needs-me"])
+def test_read_run_page_data_returns_the_stored_outcome_of_an_ended_run(
+    viewer, home, outcome
+):
+    make_run_db(home, runs=[{"outcome": outcome}])
+    run = viewer.read_run_page_data(7).run
+    assert run.summary.outcome == outcome
+    assert run.summary.status == outcome
+
+
+def test_read_run_page_data_branch_is_an_empty_string_when_null(viewer, home):
+    make_run_db(home, runs=[{"branch": None}])
+    run = viewer.read_run_page_data(7).run
+    assert run.branch == ""
+    assert run == run_detail(viewer, branch="")
+
+
+def test_read_run_page_data_reason_is_an_empty_string_when_null(viewer, home):
+    make_run_db(home, runs=[{"reason": None}])
+    run = viewer.read_run_page_data(7).run
+    assert run.reason == ""
+    assert run == run_detail(viewer, reason="")
+
+
+def test_read_run_page_data_keeps_the_reason_of_a_run_that_has_not_ended(viewer, home):
+    make_run_db(home, runs=[{"reason": "still going", **RUNNING}])
+    assert viewer.read_run_page_data(7).run.reason == "still going"
+
+
+def test_read_run_page_data_returns_the_stored_attempt_limit(viewer, home):
+    make_run_db(home, runs=[{"attempt_limit": 5}])
+    assert viewer.read_run_page_data(7).run.attempt_limit == 5
+
+
+def test_read_run_page_data_returns_text_in_full_and_unchanged(viewer, home):
+    request = "  <b>café</b> & 'quotes' ✓\n\nsecond paragraph " + "word " * 200
+    make_run_db(
+        home,
+        runs=[
+            {
+                "request": request,
+                "target": "/tmp/a&b <target>",
+                "branch": "factory/7-<b>",
+                "reason": "it's \"bad\" & <i>worse</i>",
+            }
+        ],
+        steps=[{"name": "<test>", "persona": "te&ster"}],
+    )
+    data = viewer.read_run_page_data(7)
+    assert data.run.summary.request == request
+    assert data.run.target == "/tmp/a&b <target>"
+    assert data.run.branch == "factory/7-<b>"
+    assert data.run.reason == "it's \"bad\" & <i>worse</i>"
+    assert data.steps[0].name == "<test>"
+    assert data.steps[0].persona == "te&ster"
+
+
+def test_read_run_page_data_works_when_home_path_contains_a_space(
+    viewer, tmp_path, monkeypatch
+):
+    spaced = tmp_path / "factory home"
+    make_run_db(spaced, runs=[{}], steps=[{}])
+    monkeypatch.setenv("TOMFACTORY_HOME", str(spaced))
+    data = viewer.read_run_page_data(7)
+    assert data.run == run_detail(viewer)
+    assert len(data.steps) == 1
+
+
+# --------------------------------------------------- read_run_page_data: the steps
+
+
+def test_read_run_page_data_steps_is_a_tuple_of_step_summaries(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{}, UNFINISHED])
+    steps = viewer.read_run_page_data(7).steps
+    assert type(steps) is tuple
+    assert len(steps) == 2
+    assert all(isinstance(step, viewer.StepSummary) for step in steps)
+    assert all(type(step.id) is int for step in steps)
+    assert all(type(step.attempt) is int for step in steps)
+
+
+def test_read_run_page_data_gives_an_empty_tuple_for_a_run_with_no_steps(viewer, home):
+    make_run_db(home, runs=[{}])
+    data = viewer.read_run_page_data(7)
+    assert data.run == run_detail(viewer)
+    assert data.steps == ()
+    assert type(data.steps) is tuple
+    assert data.steps is not viewer.UNREADABLE
+
+
+def test_read_run_page_data_returns_a_single_step(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{"step_id": 12}])
+    assert viewer.read_run_page_data(7).steps == (step_summary(viewer),)
+
+
+def test_read_run_page_data_returns_steps_lowest_id_first(viewer, home):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[{"name": "plan"}, {"name": "red"}, {"name": "build"}],
+    )
+    steps = viewer.read_run_page_data(7).steps
+    assert [step.id for step in steps] == [1, 2, 3]
+    assert [step.name for step in steps] == ["plan", "red", "build"]
+
+
+def test_read_run_page_data_orders_steps_by_id_not_by_insertion_order(viewer, home):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[{"step_id": 30}, {"step_id": 4}, {"step_id": 200}, {"step_id": 12}],
+    )
+    steps = viewer.read_run_page_data(7).steps
+    assert [step.id for step in steps] == [4, 12, 30, 200]
+
+
+def test_read_run_page_data_orders_steps_by_id_not_by_started_at(viewer, home):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {"step_id": 1, "started_at": "2030-01-01T00:00:00Z"},
+            {"step_id": 2, "started_at": "2020-01-01T00:00:00Z"},
+        ],
+    )
+    assert [step.id for step in viewer.read_run_page_data(7).steps] == [1, 2]
+
+
+def test_read_run_page_data_returns_only_the_steps_of_the_run_asked_for(viewer, home):
+    make_run_db(
+        home,
+        runs=[{"run_id": 6}, {"run_id": 7}, {"run_id": 8}],
+        steps=[
+            {"run_id": 6, "name": "of six"},
+            {"run_id": 7, "name": "first of seven"},
+            {"run_id": 8, "name": "of eight"},
+            {"run_id": 7, "name": "second of seven"},
+            {"run_id": 6, "name": "also of six"},
+        ],
+    )
+    steps = viewer.read_run_page_data(7).steps
+    assert [step.name for step in steps] == ["first of seven", "second of seven"]
+    assert [step.id for step in steps] == [2, 4]
+    assert [step.name for step in viewer.read_run_page_data(8).steps] == ["of eight"]
+
+
+def test_read_run_page_data_gives_no_steps_to_a_run_when_only_others_have_them(
+    viewer, home
+):
+    make_run_db(
+        home, runs=[{"run_id": 6}, {"run_id": 7}], steps=[{"run_id": 6}, {"run_id": 6}]
+    )
+    assert viewer.read_run_page_data(7).steps == ()
+    assert len(viewer.read_run_page_data(6).steps) == 2
+
+
+def test_read_run_page_data_returns_every_attempt_of_a_step(viewer, home):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {"name": "test", "attempt": 1, "passed": 0},
+            {"name": "test", "attempt": 2, "passed": 0},
+            {"name": "test", "attempt": 3, "passed": 1},
+        ],
+    )
+    steps = viewer.read_run_page_data(7).steps
+    assert [(step.name, step.attempt, step.passed) for step in steps] == [
+        ("test", 1, False),
+        ("test", 2, False),
+        ("test", 3, True),
+    ]
+
+
+def test_read_run_page_data_returns_every_step_when_there_are_many(viewer, home):
+    path = make_run_db(home, runs=[{}])
+    conn = sqlite3.connect(path)
+    try:
+        conn.executemany(
+            "INSERT INTO steps (run_id, name, kind, attempt, asked, passed, "
+            "started_at, ended_at) VALUES (7, ?, 'code', 1, 'do the work', 1, ?, ?)",
+            [(f"step number {n}", CREATED, ENDED) for n in range(1, 301)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    steps = viewer.read_run_page_data(7).steps
+    assert len(steps) == 300
+    assert [step.id for step in steps] == list(range(1, 301))
+    assert steps[0].name == "step number 1"
+    assert steps[-1].name == "step number 300"
+
+
+def test_read_run_page_data_persona_is_an_empty_string_when_null(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{"step_id": 12, "persona": None}])
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.persona == ""
+    assert step == step_summary(viewer, persona="")
+
+
+def test_read_run_page_data_passed_is_true_when_stored_as_one(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{"passed": 1}])
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.passed is True
+    assert step.finished is True
+
+
+def test_read_run_page_data_passed_is_false_when_stored_as_zero(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{"passed": 0}])
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.passed is False
+    assert step.finished is True
+
+
+def test_read_run_page_data_passed_is_none_when_null(viewer, home):
+    make_run_db(home, runs=[{}], steps=[UNFINISHED])
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.passed is None
+    assert step.finished is False
+
+
+def test_read_run_page_data_gives_an_unfinished_step_no_ended_at_and_no_checks(
+    viewer, home
+):
+    make_run_db(home, runs=[{}], steps=[{"step_id": 12, **UNFINISHED}])
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step == viewer.StepSummary(
+        12, "test", "tester", 1, CREATED_DT, None, None, ()
+    )
+    assert step.ended_at is None
+    assert step.checks == ()
+    assert step.checks is not viewer.UNREADABLE
+
+
+# -------------------------------------------------- read_run_page_data: the checks
+
+
+def test_read_run_page_data_checks_is_an_empty_tuple_when_null(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{"checks": None}])
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.checks == ()
+    assert type(step.checks) is tuple
+
+
+def test_read_run_page_data_checks_is_an_empty_tuple_for_an_empty_json_list(
+    viewer, home
+):
+    make_run_db(home, runs=[{}], steps=[{"checks": "[]"}])
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.checks == ()
+    assert step.checks is not viewer.UNREADABLE
+
+
+def test_read_run_page_data_checks_is_a_tuple_of_checks(viewer, home):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[{"checks": checks_json(("guard", True), ("tests", False))}],
+    )
+    (step,) = viewer.read_run_page_data(7).steps
+    assert type(step.checks) is tuple
+    assert all(isinstance(check, viewer.Check) for check in step.checks)
+    assert step.checks[0].passed is True
+    assert step.checks[1].passed is False
+
+
+def test_read_run_page_data_keeps_checks_in_the_order_they_are_stored(viewer, home):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {
+                "checks": checks_json(
+                    ("zeta", True), ("alpha", False), ("mid", True), ("alpha", True)
+                )
+            }
+        ],
+    )
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.checks == (
+        viewer.Check("zeta", True),
+        viewer.Check("alpha", False),
+        viewer.Check("mid", True),
+        viewer.Check("alpha", True),
+    )
+
+
+def test_read_run_page_data_reads_a_check_that_timed_out_with_a_note(viewer, home):
+    stored = json.dumps(
+        [
+            {
+                "name": "tests",
+                "passed": False,
+                "note": "gave up after 600s",
+                "timed_out": True,
+            }
+        ]
+    )
+    make_run_db(home, runs=[{}], steps=[{"checks": stored, "passed": 0}])
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.checks == (viewer.Check("tests", False),)
+
+
+def test_read_run_page_data_reads_a_check_that_has_only_a_name_and_passed(
+    viewer, home
+):
+    make_run_db(
+        home, runs=[{}], steps=[{"checks": '[{"name": "guard", "passed": true}]'}]
+    )
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.checks == (viewer.Check("guard", True),)
+
+
+def test_read_run_page_data_returns_check_names_unchanged(viewer, home):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[{"checks": checks_json(("<b>café</b> & ✓", True), ("", False))}],
+    )
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.checks == (
+        viewer.Check("<b>café</b> & ✓", True),
+        viewer.Check("", False),
+    )
+
+
+BAD_CHECKS = [
+    pytest.param("not json at all", id="text_that_is_not_json"),
+    pytest.param("", id="empty_string"),
+    pytest.param('[{"name": "guard", "passed": true}', id="truncated_json"),
+    pytest.param('{"name": "guard", "passed": true}', id="an_object_not_a_list"),
+    pytest.param('"guard"', id="a_json_string"),
+    pytest.param("42", id="a_json_number"),
+    pytest.param("null", id="json_null"),
+    pytest.param("true", id="json_true"),
+    pytest.param('["guard"]', id="an_item_that_is_a_string"),
+    pytest.param("[[]]", id="an_item_that_is_a_list"),
+    pytest.param("[null]", id="an_item_that_is_null"),
+    pytest.param('[{"passed": true}]', id="an_item_missing_name"),
+    pytest.param('[{"name": "guard"}]', id="an_item_missing_passed"),
+    pytest.param("[{}]", id="an_empty_item"),
+    pytest.param('[{"name": 5, "passed": true}]', id="a_name_that_is_a_number"),
+    pytest.param('[{"name": null, "passed": true}]', id="a_name_that_is_null"),
+    pytest.param('[{"name": "guard", "passed": 1}]', id="passed_that_is_a_number"),
+    pytest.param('[{"name": "guard", "passed": "true"}]', id="passed_that_is_text"),
+    pytest.param('[{"name": "guard", "passed": null}]', id="passed_that_is_null"),
+    pytest.param(
+        '[{"name": "guard", "passed": true}, {"name": "tests"}]',
+        id="a_good_item_followed_by_a_bad_one",
+    ),
+    pytest.param(b"\x00\x01binary", id="a_blob"),
+]
+
+
+@pytest.mark.parametrize("stored", BAD_CHECKS)
+def test_read_run_page_data_checks_are_unreadable_when_stored_as(viewer, home, stored):
+    make_run_db(home, runs=[{}], steps=[{"step_id": 12, "checks": stored}])
+    data = viewer.read_run_page_data(7)
+    (step,) = data.steps
+    assert step.checks is viewer.UNREADABLE
+    assert step == step_summary(viewer, checks=viewer.UNREADABLE)
+    assert data.run == run_detail(viewer)
+
+
+@pytest.mark.parametrize("stored", BAD_CHECKS)
+def test_read_run_page_data_keeps_the_other_steps_when_one_has_checks_stored_as(
+    viewer, home, stored
+):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {"step_id": 1, "checks": checks_json(("guard", True))},
+            {"step_id": 2, "checks": stored, "passed": 0},
+            {"step_id": 3, "checks": checks_json(("tests", False)), "passed": 0},
+            {"step_id": 4, **UNFINISHED},
+        ],
+    )
+    data = viewer.read_run_page_data(7)
+    assert data.steps is not viewer.UNREADABLE
+    assert [step.id for step in data.steps] == [1, 2, 3, 4]
+    assert [step.checks for step in data.steps] == [
+        (viewer.Check("guard", True),),
+        viewer.UNREADABLE,
+        (viewer.Check("tests", False),),
+        (),
+    ]
+    assert data.steps[1].passed is False
+
+
+# ----------------------------------------------- read_run_page_data: timestamps
+
+
+def test_read_run_page_data_parses_timestamps_as_utc_aware_datetimes(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{}])
+    data = viewer.read_run_page_data(7)
+    (step,) = data.steps
+    for parsed in (
+        data.run.summary.created_at,
+        data.run.summary.ended_at,
+        step.started_at,
+        step.ended_at,
+    ):
+        assert isinstance(parsed, datetime)
+        assert parsed.utcoffset() == timedelta(0)
+    assert step.started_at == CREATED_DT
+    assert step.ended_at == ENDED_DT
+
+
+def test_read_run_page_data_parses_step_times_with_milliseconds_keeping_them(
+    viewer, home
+):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {
+                "started_at": "2026-11-18T21:04:05.123Z",
+                "ended_at": "2026-11-18T21:07:12.623Z",
+            }
+        ],
+    )
+    (step,) = viewer.read_run_page_data(7).steps
+    assert step.started_at == CREATED_DT.replace(microsecond=123000)
+    assert step.ended_at == ENDED_DT.replace(microsecond=623000)
+    assert step.started_at.utcoffset() == timedelta(0)
+
+
+def test_read_run_page_data_parses_run_times_with_milliseconds_keeping_them(
+    viewer, home
+):
+    make_run_db(
+        home,
+        runs=[
+            {
+                "created_at": "2026-11-18T21:04:05.250Z",
+                "ended_at": "2026-11-18T21:07:12.123Z",
+            }
+        ],
+    )
+    summary = viewer.read_run_page_data(7).run.summary
+    assert summary.created_at == CREATED_DT.replace(microsecond=250000)
+    assert summary.ended_at == ENDED_DT.replace(microsecond=123000)
+
+
+STEP_TIME_FORMS = [
+    pytest.param(CREATED, ENDED, timedelta(seconds=187), id="both_in_whole_seconds"),
+    pytest.param(
+        "2026-11-18T21:04:05.123Z",
+        "2026-11-18T21:07:12.623Z",
+        timedelta(seconds=187, milliseconds=500),
+        id="both_with_milliseconds",
+    ),
+    pytest.param(
+        CREATED,
+        "2026-11-18T21:07:12.250Z",
+        timedelta(seconds=187, milliseconds=250),
+        id="whole_seconds_then_milliseconds",
+    ),
+    pytest.param(
+        "2026-11-18T21:04:05.500Z",
+        ENDED,
+        timedelta(seconds=186, milliseconds=500),
+        id="milliseconds_then_whole_seconds",
+    ),
+]
+
+
+@pytest.mark.parametrize("started, ended, expected", STEP_TIME_FORMS)
+def test_read_run_page_data_gives_the_duration_of_a_step_stored_with(
+    viewer, home, started, ended, expected
+):
+    make_run_db(home, runs=[{}], steps=[{"started_at": started, "ended_at": ended}])
+    data = viewer.read_run_page_data(7)
+    (step,) = data.steps
+    assert step.duration(data.read_at) == expected
+
+
+def test_read_run_page_data_gives_the_duration_so_far_of_an_unfinished_step_stored_with_milliseconds(
+    viewer, home
+):
+    make_run_db(
+        home,
+        runs=[{"reason": None, **RUNNING}],
+        steps=[{"started_at": "2026-11-18T21:04:05.123Z", **UNFINISHED}],
+    )
+    (step,) = viewer.read_run_page_data(7).steps
+    now = CREATED_DT + timedelta(seconds=10, milliseconds=123)
+    assert step.duration(now) == timedelta(seconds=10)
+
+
+MALFORMED_STEP_TIMES = MALFORMED_TIMES + [
+    pytest.param("2026-11-18T21:04:05.Z", id="a_dot_and_no_fraction"),
+    pytest.param("2026-11-18T21:04:05.1234567Z", id="seven_fraction_digits"),
+    pytest.param("2026-11-18T21:04:05.123", id="a_fraction_and_no_z"),
+    pytest.param("2026-11-18T21:04:05,123Z", id="a_comma_before_the_fraction"),
+]
+
+
+@pytest.mark.parametrize("stored", MALFORMED_STEP_TIMES)
+def test_read_run_page_data_step_started_at_is_none_when_stored_as(
+    viewer, home, stored
+):
+    make_run_db(home, runs=[{}], steps=[{"step_id": 12, "started_at": stored}])
+    data = viewer.read_run_page_data(7)
+    assert data.steps == (step_summary(viewer, started_at=None),)
+    assert data.steps[0].duration(data.read_at) is None
+
+
+@pytest.mark.parametrize("stored", MALFORMED_STEP_TIMES)
+def test_read_run_page_data_step_ended_at_is_none_when_stored_as(viewer, home, stored):
+    make_run_db(home, runs=[{}], steps=[{"step_id": 12, "ended_at": stored}])
+    data = viewer.read_run_page_data(7)
+    assert data.steps == (step_summary(viewer, ended_at=None),)
+    assert data.steps[0].duration(data.read_at) is None
+
+
+def test_read_run_page_data_run_created_at_is_none_when_malformed(viewer, home):
+    make_run_db(home, runs=[{"created_at": "yesterday"}])
+    summary = viewer.read_run_page_data(7).run.summary
+    assert summary.created_at is None
+    assert summary.ended_at == ENDED_DT
+
+
+def test_read_run_page_data_keeps_other_steps_when_one_has_a_malformed_time(
+    viewer, home
+):
+    make_run_db(home, runs=[{}], steps=[{}, {"started_at": "garbage"}, {}])
+    steps = viewer.read_run_page_data(7).steps
+    assert [step.id for step in steps] == [1, 2, 3]
+    assert [step.started_at for step in steps] == [CREATED_DT, None, CREATED_DT]
+
+
+# ---------------------------------------------- read_run_page_data: an unknown id
+
+
+def test_read_run_page_data_run_is_none_and_steps_empty_for_an_unknown_id(viewer, home):
+    make_run_db(home, runs=[{"run_id": 7}], steps=[{"run_id": 7}])
+    data = viewer.read_run_page_data(99)
+    assert data.run is None
+    assert data.run is not viewer.UNREADABLE
+    assert data.steps == ()
+    assert type(data.steps) is tuple
+    assert data.run_id == 99
+
+
+def test_read_run_page_data_run_is_none_for_any_id_in_an_empty_runs_table(viewer, home):
+    make_run_db(home)
+    data = viewer.read_run_page_data(1)
+    assert data.run is None
+    assert data.steps == ()
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        pytest.param(6, id="one_below_the_only_run"),
+        pytest.param(8, id="one_above_the_only_run"),
+        pytest.param(999999999999999999, id="the_largest_id_the_page_accepts"),
+    ],
+)
+def test_read_run_page_data_run_is_none_for_an_id_that(viewer, home, run_id):
+    make_run_db(home, runs=[{"run_id": 7}], steps=[{"run_id": 7}])
+    data = viewer.read_run_page_data(run_id)
+    assert data.run is None
+    assert data.steps == ()
+    assert data.run_id == run_id
+
+
+def test_read_run_page_data_does_not_return_steps_that_name_a_run_with_no_row(
+    viewer, home
+):
+    make_run_db(home, runs=[{"run_id": 7}], steps=[{"run_id": 99}, {"run_id": 99}])
+    data = viewer.read_run_page_data(99)
+    assert data.run is None
+    assert data.steps == ()
+
+
+def test_read_run_page_data_runs_no_statement_on_steps_for_an_unknown_id(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{"run_id": 7}], steps=[{"run_id": 7}, {"run_id": 99}])
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    data = viewer.read_run_page_data(99)
+
+    assert data.run is None
+    assert data.steps == ()
+    assert len(proxies) == 1
+    assert any("runs" in sql.lower() for sql in proxies[0].statements)
+    assert not any("steps" in sql.lower() for sql in proxies[0].statements)
+    assert proxies[0].close_calls == 1
+
+
+def test_read_run_page_data_runs_a_statement_on_steps_for_a_known_id(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{"run_id": 7}], steps=[{"run_id": 7}])
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    data = viewer.read_run_page_data(7)
+
+    assert len(data.steps) == 1
+    assert len(proxies) == 1
+    assert sum("steps" in sql.lower() for sql in proxies[0].statements) == 1
+
+
+def test_read_run_page_data_steps_are_empty_not_unreadable_for_an_unknown_id_without_a_steps_table(
+    viewer, home
+):
+    _make_run_without_steps_table(home)
+    data = viewer.read_run_page_data(99)
+    assert data.run is None
+    assert data.steps == ()
+    assert data.steps is not viewer.UNREADABLE
+
+
+# ------------------------------------------------- read_run_page_data: unreadable
+
+
+@pytest.mark.parametrize("break_database", UNREADABLE_RUN_DATABASES)
+def test_read_run_page_data_run_and_steps_are_unreadable_when(
+    viewer, home, break_database
+):
+    break_database(home)
+    data = viewer.read_run_page_data(7)
+    assert isinstance(data, viewer.RunPageData)
+    assert data.run is viewer.UNREADABLE
+    assert data.steps is viewer.UNREADABLE
+    assert data.run_id == 7
+
+
+@pytest.mark.parametrize("break_database", UNREADABLE_RUN_DATABASES)
+def test_read_run_page_data_never_reports_run_not_found_when(
+    viewer, home, break_database
+):
+    break_database(home)
+    data = viewer.read_run_page_data(99)
+    assert data.run is not None
+    assert data.run is viewer.UNREADABLE
+    assert data.steps != ()
+
+
+def test_read_run_page_data_run_and_steps_are_unreadable_when_home_directory_is_missing(
+    viewer, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TOMFACTORY_HOME", str(tmp_path / "does-not-exist"))
+    data = viewer.read_run_page_data(7)
+    assert data.run is viewer.UNREADABLE
+    assert data.steps is viewer.UNREADABLE
+
+
+def test_read_run_page_data_run_and_steps_are_unreadable_when_connect_raises(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{}], steps=[{}])
+
+    def failing_connect(*args, **kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", failing_connect)
+    data = viewer.read_run_page_data(7)
+    assert data.run is viewer.UNREADABLE
+    assert data.steps is viewer.UNREADABLE
+
+
+def test_read_run_page_data_run_and_steps_are_unreadable_when_every_statement_fails(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{}], steps=[{}])
+    made = break_connections(viewer, monkeypatch, fail_on="execute")
+
+    data = viewer.read_run_page_data(7)
+
+    assert data.run is viewer.UNREADABLE
+    assert data.steps is viewer.UNREADABLE
+    assert len(made) == 1
+    assert made[0].close_calls == 1
+
+
+def test_read_run_page_data_run_and_steps_are_unreadable_when_fetching_the_run_fails(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{}], steps=[{}])
+    made = break_connections(viewer, monkeypatch, fail_on="fetch")
+
+    data = viewer.read_run_page_data(7)
+
+    assert data.run is viewer.UNREADABLE
+    assert data.steps is viewer.UNREADABLE
+    assert len(made) == 1
+    assert made[0].close_calls == 1
+
+
+@pytest.mark.parametrize("break_steps", UNREADABLE_STEPS_DATABASES)
+def test_read_run_page_data_keeps_the_run_and_marks_steps_unreadable_when(
+    viewer, home, break_steps
+):
+    break_steps(home)
+    data = viewer.read_run_page_data(7)
+    assert data.run == run_detail(viewer)
+    assert data.steps is viewer.UNREADABLE
+    assert data.steps != ()
+
+
+def test_read_run_page_data_keeps_the_run_when_the_steps_statement_fails(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{}], steps=[{}])
+    proxies = wrap_connections(viewer, monkeypatch, fail_statements_on_steps)
+
+    data = viewer.read_run_page_data(7)
+
+    assert data.run == run_detail(viewer)
+    assert data.steps is viewer.UNREADABLE
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+# --------------------------------------------------- read_run_page_data: read_at
+
+
+def test_read_run_page_data_read_at_is_the_utc_time_of_the_call(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{}])
+    before = datetime.now(timezone.utc)
+    data = viewer.read_run_page_data(7)
+    after = datetime.now(timezone.utc)
+    assert data.read_at.utcoffset() == timedelta(0)
+    assert before <= data.read_at <= after
+
+
+def test_read_run_page_data_read_at_is_set_when_nothing_is_readable(viewer, home):
+    before = datetime.now(timezone.utc)
+    data = viewer.read_run_page_data(7)
+    after = datetime.now(timezone.utc)
+    assert data.run is viewer.UNREADABLE
+    assert data.read_at.utcoffset() == timedelta(0)
+    assert before <= data.read_at <= after
+
+
+def test_read_run_page_data_read_at_is_set_for_an_unknown_id(viewer, home):
+    make_run_db(home, runs=[{}])
+    before = datetime.now(timezone.utc)
+    data = viewer.read_run_page_data(99)
+    after = datetime.now(timezone.utc)
+    assert data.run is None
+    assert before <= data.read_at <= after
+
+
+def test_read_run_page_data_read_at_is_set_when_only_the_steps_are_unreadable(
+    viewer, home
+):
+    _make_run_without_steps_table(home)
+    before = datetime.now(timezone.utc)
+    data = viewer.read_run_page_data(7)
+    after = datetime.now(timezone.utc)
+    assert data.steps is viewer.UNREADABLE
+    assert before <= data.read_at <= after
+
+
+# -------------------------------- read_run_page_data: one read-only connection
+
+
+def test_read_run_page_data_opens_one_read_only_connection_for_run_and_steps(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{}], steps=[{}, {}])
+    calls = record_connects(viewer, monkeypatch)
+
+    data = viewer.read_run_page_data(7)
+
+    assert data.run == run_detail(viewer)
+    assert len(data.steps) == 2
+    assert_one_read_only_connect(calls)
+
+
+def test_read_run_page_data_opens_one_read_only_connection_for_an_unknown_id(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{}])
+    calls = record_connects(viewer, monkeypatch)
+
+    assert viewer.read_run_page_data(99).run is None
+    assert_one_read_only_connect(calls)
+
+
+def test_read_run_page_data_tries_to_connect_only_once_when_the_database_is_missing(
+    viewer, home, monkeypatch
+):
+    calls = record_connects(viewer, monkeypatch)
+
+    assert viewer.read_run_page_data(7).run is viewer.UNREADABLE
+    assert_one_read_only_connect(calls)
+
+
+def test_read_run_page_data_opens_one_read_only_connection_when_steps_are_unreadable(
+    viewer, home, monkeypatch
+):
+    _make_run_without_steps_table(home)
+    calls = record_connects(viewer, monkeypatch)
+
+    assert viewer.read_run_page_data(7).steps is viewer.UNREADABLE
+    assert_one_read_only_connect(calls)
+
+
+def test_read_run_page_data_opens_one_connection_per_call(viewer, home, monkeypatch):
+    make_run_db(home, runs=[{}])
+    calls = record_connects(viewer, monkeypatch)
+
+    viewer.read_run_page_data(7)
+    viewer.read_run_page_data(7)
+    assert len(calls) == 2
+
+
+def test_read_run_page_data_closes_its_connection_once_after_a_successful_read(
+    viewer, home, monkeypatch
+):
+    make_run_db(home, runs=[{}], steps=[{}, {}])
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert len(viewer.read_run_page_data(7).steps) == 2
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+def test_read_run_page_data_closes_its_connection_when_the_runs_table_is_missing(
+    viewer, home, monkeypatch
+):
+    make_db(home, with_runs_table=False)
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert viewer.read_run_page_data(7).run is viewer.UNREADABLE
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+def test_read_run_page_data_closes_its_connection_when_the_steps_table_is_missing(
+    viewer, home, monkeypatch
+):
+    _make_run_without_steps_table(home)
+    proxies = wrap_connections(viewer, monkeypatch)
+
+    assert viewer.read_run_page_data(7).steps is viewer.UNREADABLE
+    assert len(proxies) == 1
+    assert proxies[0].close_calls == 1
+
+
+# -------------------------------------------- read_run_page_data: one moment
+
+
+def test_read_run_page_data_run_and_steps_come_from_the_same_moment(
+    viewer, home, monkeypatch
+):
+    path = home / "factory.db"
+    real_connect = sqlite3.connect
+    # Kept open so the database stays in WAL mode with its -wal and -shm files.
+    holder = real_connect(path)
+    try:
+        mode = holder.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        assert mode.lower() == "wal"
+        holder.executescript(RUNS_DDL + STEPS_DDL)
+        holder.commit()
+        insert_detail_run(path)
+        insert_step(path, name="plan")
+
+        inserted = []
+
+        def insert_second_step_after_the_run_is_read(sql):
+            lowered = sql.lower()
+            if "runs" not in lowered or "steps" in lowered or inserted:
+                return
+            inserted.append("attempted")
+            writer = real_connect(path, timeout=2)
+            try:
+                writer.execute(
+                    "INSERT INTO steps (run_id, name, kind, attempt, asked, started_at) "
+                    "VALUES (7, 'build', 'agent', 1, 'do the work', ?)",
+                    (CREATED,),
+                )
+                writer.commit()
+                inserted.append("committed")
+            except sqlite3.Error as error:  # reported by the assertion below
+                inserted.append(error)
+            finally:
+                writer.close()
+
+        proxies = wrap_connections(
+            viewer, monkeypatch, insert_second_step_after_the_run_is_read
+        )
+
+        data = viewer.read_run_page_data(7)
+
+        assert inserted == ["attempted", "committed"], (
+            "the second step must be written between the run read and the steps read"
+        )
+        assert len(proxies) == 1
+        assert data.run == run_detail(viewer)
+        assert [step.name for step in data.steps] == ["plan"]
+
+        # The second step really was committed: the next read shows it.
+        assert [step.name for step in viewer.read_run_page_data(7).steps] == [
+            "plan",
+            "build",
+        ]
+    finally:
+        holder.close()
+
+
+# ------------------------------ read_run_page_data: never writes or creates
+
+
+def test_read_run_page_data_does_not_create_a_missing_database_file(viewer, home):
+    assert viewer.read_run_page_data(7).run is viewer.UNREADABLE
+    assert viewer.read_run_page_data(7).run is viewer.UNREADABLE
+    assert not (home / "factory.db").exists()
+    assert list(home.iterdir()) == []
+
+
+def test_read_run_page_data_does_not_create_a_missing_home_directory(
+    viewer, tmp_path, monkeypatch
+):
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setenv("TOMFACTORY_HOME", str(missing))
+    assert viewer.read_run_page_data(7).run is viewer.UNREADABLE
+    assert not missing.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_read_run_page_data_leaves_the_database_file_unchanged(viewer, home):
+    path = make_run_db(
+        home,
+        runs=[{}],
+        steps=[{"checks": checks_json(("guard", True))}, {"checks": "not json"}],
+    )
+    before = path.read_bytes()
+    assert len(viewer.read_run_page_data(7).steps) == 2
+    assert len(viewer.read_run_page_data(7).steps) == 2
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_run_page_data_leaves_the_database_file_unchanged_for_an_unknown_id(
+    viewer, home
+):
+    path = make_run_db(home, runs=[{}], steps=[{}])
+    before = path.read_bytes()
+    assert viewer.read_run_page_data(99).run is None
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_run_page_data_leaves_a_database_without_a_steps_table_unchanged(
+    viewer, home
+):
+    _make_run_without_steps_table(home)
+    path = home / "factory.db"
+    before = path.read_bytes()
+    assert viewer.read_run_page_data(7).steps is viewer.UNREADABLE
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_run_page_data_leaves_a_non_sqlite_file_unchanged(viewer, home):
+    _write_non_sqlite_file(home)
+    path = home / "factory.db"
+    before = path.read_bytes()
+    assert viewer.read_run_page_data(7).run is viewer.UNREADABLE
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_read_run_page_data_leaves_an_empty_database_file_empty(viewer, home):
+    _write_empty_file(home)
+    assert viewer.read_run_page_data(7).run is viewer.UNREADABLE
+    assert (home / "factory.db").read_bytes() == b""
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+# -------------------------------------------- read_run_page_data: between calls
+
+
+def test_read_run_page_data_called_twice_returns_the_same_run_and_steps(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{}, {"passed": 0}])
+    first = viewer.read_run_page_data(7)
+    second = viewer.read_run_page_data(7)
+    assert first.run == second.run == run_detail(viewer)
+    assert first.steps == second.steps
+    assert len(first.steps) == 2
+    assert first.read_at <= second.read_at
+
+
+def test_read_run_page_data_sees_a_newly_started_step_on_the_next_call(viewer, home):
+    path = make_run_db(home, runs=[{"reason": None, **RUNNING}], steps=[{}])
+    assert [step.id for step in viewer.read_run_page_data(7).steps] == [1]
+    insert_step(path, name="build", **UNFINISHED)
+    steps = viewer.read_run_page_data(7).steps
+    assert [step.name for step in steps] == ["test", "build"]
+    assert steps[1].finished is False
+
+
+def test_read_run_page_data_sees_a_step_finishing_on_the_next_call(viewer, home):
+    path = make_run_db(
+        home, runs=[{"reason": None, **RUNNING}], steps=[{"step_id": 12, **UNFINISHED}]
+    )
+    (before,) = viewer.read_run_page_data(7).steps
+    assert before.passed is None
+    assert before.checks == ()
+
+    execute_sql(
+        path,
+        "UPDATE steps SET passed = 0, ended_at = ?, checks = ? WHERE id = 12",
+        (ENDED, checks_json(("tests", False))),
+    )
+
+    (after,) = viewer.read_run_page_data(7).steps
+    assert after == step_summary(
+        viewer, passed=False, checks=(viewer.Check("tests", False),)
+    )
+
+
+def test_read_run_page_data_sees_the_run_ending_on_the_next_call(viewer, home):
+    path = make_run_db(home, runs=[{"reason": None, **RUNNING}])
+    assert viewer.read_run_page_data(7).run == running_detail(viewer)
+
+    execute_sql(
+        path,
+        "UPDATE runs SET state = 'ended', outcome = 'needs-me', "
+        "reason = 'interrupted', ended_at = ?",
+        (ENDED,),
+    )
+
+    assert viewer.read_run_page_data(7).run == run_detail(
+        viewer, outcome="needs-me", reason="interrupted"
+    )
+
+
+def test_read_run_page_data_finds_a_run_once_it_has_been_inserted(viewer, home):
+    path = make_run_db(home)
+    assert viewer.read_run_page_data(7).run is None
+    insert_detail_run(path)
+    assert viewer.read_run_page_data(7).run == run_detail(viewer)
+
+
+def test_read_run_page_data_recovers_once_the_database_appears(viewer, home):
+    assert viewer.read_run_page_data(7).run is viewer.UNREADABLE
+    make_run_db(home, runs=[{}], steps=[{}])
+    data = viewer.read_run_page_data(7)
+    assert data.run == run_detail(viewer)
+    assert len(data.steps) == 1
+
+
+def test_read_run_page_data_steps_become_readable_once_the_steps_table_appears(
+    viewer, home
+):
+    _make_run_without_steps_table(home)
+    assert viewer.read_run_page_data(7).steps is viewer.UNREADABLE
+
+    conn = sqlite3.connect(home / "factory.db")
+    try:
+        conn.executescript(STEPS_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert viewer.read_run_page_data(7).steps == ()
+
+
+def test_read_run_page_data_reads_the_environment_on_every_call(
+    viewer, tmp_path, monkeypatch
+):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    make_run_db(first, runs=[{"request": "from first"}])
+    make_run_db(second, runs=[{"request": "from second"}])
+    monkeypatch.setenv("TOMFACTORY_HOME", str(first))
+    assert viewer.read_run_page_data(7).run.summary.request == "from first"
+    monkeypatch.setenv("TOMFACTORY_HOME", str(second))
+    assert viewer.read_run_page_data(7).run.summary.request == "from second"
+
+
+# ------------------------------------------------ render_run_page: the documents
+
+
+def test_render_run_page_for_a_run_with_steps_is_exactly_the_planned_document(viewer):
+    check = viewer.Check
+    steps = [
+        step_summary(
+            viewer,
+            step_id=11,
+            name="red",
+            persona="test-writer",
+            checks=(check("guard", True),),
+        ),
+        step_summary(
+            viewer,
+            step_id=12,
+            attempt=2,
+            passed=False,
+            checks=(check("guard", True), check("tests", False)),
+        ),
+    ]
+    page = render_run(viewer, run_detail(viewer), steps)
+    assert page == (
+        RUN_7_HEAD
+        + run_facts()
+        + STEPS_TABLE_OPEN
+        + step_row(11, "red", "test-writer", 1, "3m 7s", "passed", check_span("guard"))
+        + step_row(
+            12,
+            "test",
+            "tester",
+            2,
+            "3m 7s",
+            "failed",
+            check_span("guard") + ", " + failed_check_span("tests"),
+        )
+        + STEPS_TABLE_CLOSE
+        + DOCUMENT_TAIL
+    )
+
+
+def test_render_run_page_shows_the_run_and_step_lines_the_plan_spells_out(viewer):
+    run = run_detail(viewer, request="the full request")
+    step = step_summary(
+        viewer,
+        attempt=2,
+        passed=False,
+        checks=(viewer.Check("guard", True), viewer.Check("tests", False)),
+    )
+    page = render_run(viewer, run, [step])
+    assert (
+        "<h1>Run 7</h1>\n"
+        '<dl id="run">\n'
+        '<dt>Request</dt><dd id="run-request">the full request</dd>\n'
+        '<dt>Target</dt><dd id="run-target">/path/to/target</dd>\n'
+        '<dt>Branch</dt><dd id="run-branch">factory/7-add-a-page</dd>\n'
+        '<dt>Outcome</dt><dd id="run-status">accepted</dd>\n'
+        '<dt>Reason</dt><dd id="run-reason">all checks passed</dd>\n'
+        '<dt>Attempt limit</dt><dd id="run-attempt-limit">3</dd>\n'
+        "</dl>\n"
+        '<table id="steps">\n'
+        "<thead>\n"
+        "<tr><th>Name</th><th>Persona</th><th>Attempt</th><th>Duration</th>"
+        "<th>Result</th><th>Checks</th></tr>\n"
+        "</thead>\n"
+        "<tbody>\n"
+        '<tr id="step-12"><td class="step-name">test</td>'
+        '<td class="step-persona">tester</td><td class="step-attempt">2</td>'
+        '<td class="step-duration">3m 7s</td><td class="step-result">failed</td>'
+        '<td class="step-checks"><span class="check">guard</span>, '
+        '<span class="check check-failed">tests (failed)</span></td></tr>\n'
+        "</tbody>\n"
+        "</table>\n"
+        "</body>\n"
+    ) in page
+    assert "<title>Run 7 - tomfactory viewer</title>\n" in page
+
+
+def test_render_run_page_for_a_run_with_no_steps_is_exactly_the_planned_document(
+    viewer,
+):
+    page = render_run(viewer, run_detail(viewer), [])
+    assert page == RUN_7_HEAD + run_facts() + NO_STEPS_LINE + DOCUMENT_TAIL
+
+
+def test_render_run_page_for_unreadable_steps_is_exactly_the_planned_document(viewer):
+    page = render_run(viewer, run_detail(viewer), viewer.UNREADABLE)
+    assert page == RUN_7_HEAD + run_facts() + STEPS_UNAVAILABLE_LINE + DOCUMENT_TAIL
+
+
+def test_render_run_page_for_an_unreadable_run_is_exactly_the_planned_document(viewer):
+    page = render_run(viewer, viewer.UNREADABLE, viewer.UNREADABLE)
+    assert page == RUN_7_HEAD + RUN_UNAVAILABLE_LINE + DOCUMENT_TAIL
+
+
+def test_render_run_page_for_a_run_not_found_is_exactly_the_planned_document(viewer):
+    page = render_run(viewer, None, (), run_id=99)
+    assert page == RUN_NOT_FOUND_HEAD + run_not_found_line(99) + DOCUMENT_TAIL
+
+
+def test_render_run_page_names_the_run_id_in_the_title_and_heading(viewer):
+    page = render_run(viewer, run_detail(viewer, run_id=123), run_id=123)
+    assert "<title>Run 123 - tomfactory viewer</title>\n" in page
+    assert "<h1>Run 123</h1>\n" in page
+    assert "Run 7" not in page
+
+
+def test_render_run_page_names_the_run_id_when_the_run_is_unreadable(viewer):
+    page = render_run(viewer, viewer.UNREADABLE, viewer.UNREADABLE, run_id=123)
+    assert page == (
+        run_head("Run 123 - tomfactory viewer", "Run 123")
+        + RUN_UNAVAILABLE_LINE
+        + DOCUMENT_TAIL
+    )
+
+
+def test_render_run_page_names_the_id_that_was_not_found(viewer):
+    page = render_run(viewer, None, (), run_id=999999999999999999)
+    assert run_not_found_line(999999999999999999) in page
+    assert "<title>Run not found - tomfactory viewer</title>\n" in page
+    assert "<h1>Run not found</h1>\n" in page
+
+
+def test_render_run_page_for_a_run_not_found_shows_no_run_and_no_steps(viewer):
+    page = render_run(viewer, None, (), run_id=99)
+    assert 'id="run"' not in page
+    assert "<table" not in page
+    assert "no-steps" not in page
+    assert "unavailable" not in page
+
+
+def test_render_run_page_for_a_run_not_found_does_not_depend_on_read_at(viewer):
+    early = render_run(viewer, None, (), read_at=CREATED_DT, run_id=99)
+    late = render_run(viewer, None, (), read_at=ENDED_DT + timedelta(days=9), run_id=99)
+    assert early == late
+    assert run_not_found_line(99) in early
+
+
+def test_render_run_page_for_an_unreadable_run_shows_no_steps_line(viewer):
+    page = render_run(viewer, viewer.UNREADABLE, viewer.UNREADABLE)
+    assert RUN_UNAVAILABLE_LINE in page
+    assert "steps-unavailable" not in page
+    assert "no-steps" not in page
+    assert "run-not-found" not in page
+    assert "<table" not in page
+    assert 'id="run"' not in page
+
+
+def test_render_run_page_differs_between_not_found_and_unreadable(viewer):
+    not_found = render_run(viewer, None, ())
+    unreadable = render_run(viewer, viewer.UNREADABLE, viewer.UNREADABLE)
+    assert not_found != unreadable
+    assert "run-unavailable" not in not_found
+    assert "run-not-found" not in unreadable
+
+
+def test_render_run_page_differs_between_no_steps_and_unreadable_steps(viewer):
+    empty = render_run(viewer, run_detail(viewer), [])
+    unreadable = render_run(viewer, run_detail(viewer), viewer.UNREADABLE)
+    assert empty != unreadable
+    assert NO_STEPS_LINE in empty
+    assert "steps-unavailable" not in empty
+    assert STEPS_UNAVAILABLE_LINE in unreadable
+    assert "No steps recorded yet" not in unreadable
+    assert "<table" not in empty
+    assert "<table" not in unreadable
+
+
+def test_render_run_page_shows_a_table_and_no_message_when_there_are_steps(viewer):
+    page = render_run(viewer, run_detail(viewer), [step_summary(viewer)])
+    assert '<table id="steps">' in page
+    assert page.count("<table") == 1
+    assert "no-steps" not in page
+    assert "steps-unavailable" not in page
+
+
+def test_render_run_page_is_a_complete_html_document(viewer):
+    page = render_run(viewer, run_detail(viewer), [step_summary(viewer)])
+    assert page.startswith("<!doctype html>\n")
+    assert page.endswith(DOCUMENT_TAIL)
+    assert "Hello from the factory" not in page
+    assert "<h1>Runs</h1>" not in page
+
+
+def test_render_run_page_takes_one_run_page_data_and_no_other_argument(viewer):
+    data = viewer.RunPageData(7, run_detail(viewer), (), ENDED_DT)
+    assert NO_STEPS_LINE in viewer.render_run_page(data)
+    with pytest.raises(TypeError):
+        viewer.render_run_page(data, ENDED_DT)
+    with pytest.raises(TypeError):
+        viewer.render_run_page(data, now=ENDED_DT)
+
+
+def test_render_run_page_called_twice_with_the_same_data_returns_the_same_page(viewer):
+    data = viewer.RunPageData(
+        7, running_detail(viewer), (unfinished_step(viewer),), ENDED_DT
+    )
+    first = viewer.render_run_page(data)
+    assert first == viewer.render_run_page(data)
+    assert 'id="step-12"' in first
+
+
+# ------------------------------------------------- render_run_page: the run's facts
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "rejected", "needs-me"])
+def test_render_run_page_labels_the_status_outcome_for_an_ended_run(viewer, outcome):
+    page = render_run(viewer, run_detail(viewer, outcome=outcome))
+    assert f'<dt>Outcome</dt><dd id="run-status">{outcome}</dd>\n' in page
+    assert "<dt>State</dt>" not in page
+    assert '<dd id="run-status">ended</dd>' not in page
+
+
+@pytest.mark.parametrize("state", ["planning", "awaiting_approval", "working"])
+def test_render_run_page_labels_the_status_state_for_a_run_that_has_not_ended(
+    viewer, state
+):
+    page = render_run(viewer, running_detail(viewer, state=state))
+    assert f'<dt>State</dt><dd id="run-status">{state}</dd>\n' in page
+    assert "<dt>Outcome</dt>" not in page
+
+
+def test_render_run_page_decides_outcome_or_state_by_the_outcome_not_the_state(viewer):
+    stale_state = render_run(viewer, run_detail(viewer, state="working", outcome="rejected"))
+    assert '<dt>Outcome</dt><dd id="run-status">rejected</dd>\n' in stale_state
+
+    no_outcome = render_run(viewer, run_detail(viewer, state="ended", outcome=""))
+    assert '<dt>State</dt><dd id="run-status">ended</dd>\n' in no_outcome
+
+
+def test_render_run_page_shows_the_status_exactly_once(viewer):
+    page = render_run(viewer, run_detail(viewer))
+    assert page.count('id="run-status"') == 1
+
+
+def test_render_run_page_shows_the_reason_of_an_ended_run(viewer):
+    page = render_run(viewer, run_detail(viewer, outcome="rejected", reason="tests red"))
+    assert (
+        '<dt>Outcome</dt><dd id="run-status">rejected</dd>\n'
+        '<dt>Reason</dt><dd id="run-reason">tests red</dd>\n'
+        '<dt>Attempt limit</dt>'
+    ) in page
+    assert page.count('id="run-reason"') == 1
+
+
+def test_render_run_page_leaves_out_the_reason_of_an_ended_run_with_an_empty_reason(
+    viewer,
+):
+    page = render_run(viewer, run_detail(viewer, reason=""))
+    assert run_facts(reason=None) in page
+    assert "run-reason" not in page
+    assert "<dt>Reason</dt>" not in page
+
+
+def test_render_run_page_leaves_out_the_reason_of_a_run_that_has_not_ended(viewer):
+    page = render_run(viewer, running_detail(viewer, reason="still going"))
+    assert run_facts(label="State", status="working", reason=None) in page
+    assert "run-reason" not in page
+    assert "still going" not in page
+
+
+def test_render_run_page_leaves_out_the_reason_of_a_running_run_without_one(viewer):
+    page = render_run(viewer, running_detail(viewer))
+    assert run_facts(label="State", status="working", reason=None) in page
+    assert "<dt>Reason</dt>" not in page
+
+
+def test_render_run_page_shows_none_for_an_empty_branch(viewer):
+    page = render_run(viewer, run_detail(viewer, branch=""))
+    assert '<dt>Branch</dt><dd id="run-branch">none</dd>\n' in page
+
+
+def test_render_run_page_shows_a_branch_that_is_set(viewer):
+    page = render_run(viewer, run_detail(viewer, branch="factory/8-add-a-page-at"))
+    assert '<dt>Branch</dt><dd id="run-branch">factory/8-add-a-page-at</dd>\n' in page
+    assert ">none<" not in page
+
+
+def test_render_run_page_shows_the_target(viewer):
+    page = render_run(viewer, run_detail(viewer, target="/home/op/code/viewer"))
+    assert '<dt>Target</dt><dd id="run-target">/home/op/code/viewer</dd>\n' in page
+
+
+def test_render_run_page_shows_the_attempt_limit(viewer):
+    page = render_run(viewer, run_detail(viewer, attempt_limit=5))
+    assert '<dt>Attempt limit</dt><dd id="run-attempt-limit">5</dd>\n' in page
+
+
+def test_render_run_page_shows_a_long_request_in_full_without_an_ellipsis(viewer):
+    request = TEN_WORDS + " eleven twelve thirteen"
+    page = render_run(viewer, run_detail(viewer, request=request))
+    assert f'<dt>Request</dt><dd id="run-request">{request}</dd>\n' in page
+    assert "…" not in page
+
+
+def test_render_run_page_shows_a_very_long_request_in_full(viewer):
+    request = TEN_WORDS + " tail" * 5000
+    page = render_run(viewer, run_detail(viewer, request=request))
+    assert f'<dd id="run-request">{request}</dd>' in page
+    assert page.count("tail") == 5000
+
+
+def test_render_run_page_keeps_non_ascii_text(viewer):
+    page = render_run(
+        viewer, run_detail(viewer, request="Ajouter un café ✓", reason="terminé ✓")
+    )
+    assert '<dd id="run-request">Ajouter un café ✓</dd>' in page
+    assert '<dd id="run-reason">terminé ✓</dd>' in page
+
+
+def test_render_run_page_shows_the_run_facts_when_the_steps_are_unreadable(viewer):
+    page = render_run(viewer, run_detail(viewer), viewer.UNREADABLE)
+    assert run_facts() in page
+    assert "run-unavailable" not in page
+
+
+def test_render_run_page_run_facts_do_not_depend_on_read_at(viewer):
+    early = render_run(viewer, run_detail(viewer), [step_summary(viewer)])
+    late = render_run(
+        viewer,
+        run_detail(viewer),
+        [step_summary(viewer)],
+        read_at=ENDED_DT + timedelta(days=30),
+    )
+    assert early == late
+    assert "so far" not in early
+
+
+# ----------------------------------------------------- render_run_page: the steps
+
+
+def test_render_run_page_shows_the_exact_row_of_a_step_that_passed(viewer):
+    step = step_summary(viewer, step_id=3, name="plan", persona="planner", attempt=1)
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_row(3, "plan", "planner", 1, "3m 7s", "passed", "") in page
+
+
+def test_render_run_page_shows_the_exact_row_of_a_step_that_failed(viewer):
+    step = step_summary(viewer, step_id=4, name="build", persona="builder", attempt=3, passed=False)
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_row(4, "build", "builder", 3, "3m 7s", "failed", "") in page
+
+
+def test_render_run_page_shows_the_exact_row_of_an_unfinished_step(viewer):
+    step = unfinished_step(viewer, step_id=5, name="document", persona="documenter")
+    page = render_run(
+        viewer,
+        running_detail(viewer),
+        [step],
+        read_at=CREATED_DT + timedelta(seconds=187),
+    )
+    assert (
+        step_row(5, "document", "documenter", 1, "3m 7s so far", "not finished", "")
+        in page
+    )
+
+
+def test_render_run_page_says_passed_failed_and_not_finished_in_the_result_cell(viewer):
+    steps = [
+        step_summary(viewer, step_id=1, passed=True),
+        step_summary(viewer, step_id=2, passed=False),
+        unfinished_step(viewer, step_id=3),
+    ]
+    page = render_run(viewer, running_detail(viewer), steps)
+    assert re.findall(r'<td class="step-result">([^<]*)</td>', page) == [
+        "passed",
+        "failed",
+        "not finished",
+    ]
+
+
+def test_render_run_page_keeps_step_rows_in_the_order_given(viewer):
+    steps = [step_summary(viewer, step_id=n) for n in (30, 4, 12)]
+    page = render_run(viewer, run_detail(viewer), steps)
+    assert re.findall(r'<tr id="step-(\d+)">', page) == ["30", "4", "12"]
+
+
+def test_render_run_page_shows_one_row_per_step_inside_one_table(viewer):
+    steps = [step_summary(viewer, step_id=n) for n in (1, 2)] + [
+        unfinished_step(viewer, step_id=3)
+    ]
+    page = render_run(viewer, running_detail(viewer), steps)
+    assert page.count("<table") == 1
+    assert page.count('<tr id="step-') == 3
+    assert page.count("so far") == 1
+    assert page.count("not finished") == 1
+    assert STEPS_TABLE_OPEN + step_row(1) in page
+    assert page.endswith(
+        step_row(3, duration="3m 7s so far", result="not finished")
+        + STEPS_TABLE_CLOSE
+        + DOCUMENT_TAIL
+    )
+
+
+def test_render_run_page_shows_every_step_when_there_are_many(viewer):
+    steps = [step_summary(viewer, step_id=n) for n in range(1, 301)]
+    page = render_run(viewer, run_detail(viewer), steps)
+    assert page.count('<tr id="step-') == 300
+    assert '<tr id="step-1">' in page
+    assert '<tr id="step-300">' in page
+
+
+def test_render_run_page_shows_every_attempt_of_a_step_as_its_own_row(viewer):
+    steps = [
+        step_summary(viewer, step_id=1, attempt=1, passed=False),
+        step_summary(viewer, step_id=2, attempt=2, passed=True),
+    ]
+    page = render_run(viewer, run_detail(viewer), steps)
+    assert step_row(1, attempt=1, result="failed") in page
+    assert step_row(2, attempt=2, result="passed") in page
+
+
+def test_render_run_page_shows_an_empty_cell_for_an_empty_persona(viewer):
+    page = render_run(viewer, run_detail(viewer), [step_summary(viewer, persona="")])
+    assert step_row(12, persona="") in page
+    assert '<td class="step-persona"></td>' in page
+
+
+# ------------------------------------------- render_run_page: a step's duration
+
+
+def test_render_run_page_finished_step_duration_does_not_say_so_far(viewer):
+    page = render_run(viewer, running_detail(viewer), [step_summary(viewer)])
+    assert step_duration_cell("3m 7s") in page
+    assert "so far" not in page
+
+
+def test_render_run_page_unfinished_step_duration_is_measured_to_read_at(viewer):
+    steps = [unfinished_step(viewer)]
+    run = running_detail(viewer)
+    early = render_run(viewer, run, steps, read_at=CREATED_DT + timedelta(seconds=5))
+    late = render_run(
+        viewer, run, steps, read_at=CREATED_DT + timedelta(hours=2, seconds=7)
+    )
+    assert step_duration_cell("5s so far") in early
+    assert step_duration_cell("2h 0m 7s so far") in late
+
+
+def test_render_run_page_uses_read_at_and_not_the_current_time(viewer):
+    long_ago = datetime(2001, 1, 1, tzinfo=timezone.utc)
+    step = unfinished_step(viewer, started_at=long_ago)
+    page = render_run(
+        viewer,
+        running_detail(viewer),
+        [step],
+        read_at=long_ago + timedelta(seconds=42),
+    )
+    assert step_duration_cell("42s so far") in page
+
+
+@pytest.mark.parametrize("seconds, text", DURATIONS)
+def test_render_run_page_formats_the_duration_of_a_finished_step_lasting(
+    viewer, seconds, text
+):
+    step = step_summary(viewer, ended_at=CREATED_DT + timedelta(seconds=seconds))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_duration_cell(text) in page
+
+
+@pytest.mark.parametrize("seconds, text", DURATIONS)
+def test_render_run_page_formats_the_duration_so_far_of_a_step_running_for(
+    viewer, seconds, text
+):
+    page = render_run(
+        viewer,
+        running_detail(viewer),
+        [unfinished_step(viewer)],
+        read_at=CREATED_DT + timedelta(seconds=seconds),
+    )
+    assert step_duration_cell(text + " so far") in page
+
+
+def test_render_run_page_shows_a_step_duration_in_whole_seconds(viewer):
+    step = step_summary(
+        viewer,
+        started_at=CREATED_DT.replace(microsecond=123000),
+        ended_at=ENDED_DT.replace(microsecond=623000),
+    )
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_duration_cell("3m 7s") in page
+
+
+def test_render_run_page_shows_unknown_duration_for_a_finished_step_without_started_at(
+    viewer,
+):
+    page = render_run(
+        viewer, run_detail(viewer), [step_summary(viewer, started_at=None)]
+    )
+    assert step_row(12, duration="unknown") in page
+    assert "so far" not in page
+
+
+def test_render_run_page_shows_unknown_duration_for_a_finished_step_without_ended_at(
+    viewer,
+):
+    page = render_run(
+        viewer,
+        run_detail(viewer),
+        [step_summary(viewer, passed=False, ended_at=None)],
+        read_at=ENDED_DT + timedelta(days=2),
+    )
+    assert step_row(12, duration="unknown", result="failed") in page
+    assert "so far" not in page
+
+
+def test_render_run_page_does_not_say_so_far_when_an_unfinished_duration_is_unknown(
+    viewer,
+):
+    page = render_run(
+        viewer, running_detail(viewer), [unfinished_step(viewer, started_at=None)]
+    )
+    assert step_row(12, duration="unknown", result="not finished") in page
+    assert "so far" not in page
+
+
+def test_render_run_page_shows_zero_seconds_for_a_step_that_ended_before_it_began(
+    viewer,
+):
+    step = step_summary(viewer, ended_at=CREATED_DT - timedelta(minutes=5))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_duration_cell("0s") in page
+    assert 'step-duration">-' not in page
+
+
+def test_render_run_page_shows_zero_seconds_so_far_when_read_before_the_step_began(
+    viewer,
+):
+    page = render_run(
+        viewer,
+        running_detail(viewer),
+        [unfinished_step(viewer)],
+        read_at=CREATED_DT - timedelta(minutes=5),
+    )
+    assert step_duration_cell("0s so far") in page
+
+
+# ---------------------------------------------- render_run_page: a step's checks
+
+
+def test_render_run_page_shows_an_empty_cell_for_a_step_with_no_checks(viewer):
+    page = render_run(viewer, run_detail(viewer), [step_summary(viewer, checks=())])
+    assert step_checks_cell("") in page
+    assert 'class="check' not in page
+
+
+def test_render_run_page_shows_a_passed_check_by_name_without_a_mark(viewer):
+    step = step_summary(viewer, checks=(viewer.Check("guard", True),))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_checks_cell('<span class="check">guard</span>') in page
+    assert "check-failed" not in page
+    assert "(failed)" not in page
+
+
+def test_render_run_page_marks_a_failed_check_with_a_class_and_the_word_failed(viewer):
+    step = step_summary(viewer, passed=False, checks=(viewer.Check("tests", False),))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert (
+        step_checks_cell('<span class="check check-failed">tests (failed)</span>')
+        in page
+    )
+    assert '<span class="check">tests</span>' not in page
+
+
+def test_render_run_page_marks_only_the_checks_that_failed(viewer):
+    check = viewer.Check
+    step = step_summary(
+        viewer,
+        passed=False,
+        checks=(
+            check("guard", True),
+            check("tests", False),
+            check("lint", True),
+            check("docs", False),
+        ),
+    )
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert (
+        step_checks_cell(
+            check_span("guard")
+            + ", "
+            + failed_check_span("tests")
+            + ", "
+            + check_span("lint")
+            + ", "
+            + failed_check_span("docs")
+        )
+        in page
+    )
+    assert page.count("check-failed") == 2
+    assert page.count("(failed)") == 2
+
+
+def test_render_run_page_keeps_checks_in_the_order_given(viewer):
+    names = ["zeta", "alpha", "mid"]
+    step = step_summary(viewer, checks=tuple(viewer.Check(name, True) for name in names))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert re.findall(r'<span class="check">([^<]*)</span>', page) == names
+
+
+def test_render_run_page_shows_a_single_check_without_a_separator(viewer):
+    step = step_summary(viewer, checks=(viewer.Check("guard", True),))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_checks_cell(check_span("guard")) in page
+    assert "</span>," not in page
+
+
+def test_render_run_page_marks_a_failed_check_of_a_step_that_passed(viewer):
+    # The mark follows the check, not the step's own result.
+    step = step_summary(viewer, passed=True, checks=(viewer.Check("lint", False),))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_row(12, result="passed", checks=failed_check_span("lint")) in page
+
+
+def test_render_run_page_does_not_mark_a_passed_check_of_a_step_that_failed(viewer):
+    step = step_summary(viewer, passed=False, checks=(viewer.Check("guard", True),))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_row(12, result="failed", checks=check_span("guard")) in page
+    assert "check-failed" not in page
+
+
+def test_render_run_page_says_unreadable_for_checks_that_could_not_be_read(viewer):
+    step = step_summary(viewer, passed=False, checks=viewer.UNREADABLE)
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert step_row(12, result="failed", checks="unreadable") in page
+    assert 'class="check' not in page
+
+
+def test_render_run_page_shows_other_steps_checks_beside_unreadable_ones(viewer):
+    steps = [
+        step_summary(viewer, step_id=1, checks=(viewer.Check("guard", True),)),
+        step_summary(viewer, step_id=2, checks=viewer.UNREADABLE),
+        step_summary(viewer, step_id=3, checks=()),
+    ]
+    page = render_run(viewer, run_detail(viewer), steps)
+    assert step_row(1, checks=check_span("guard")) in page
+    assert step_row(2, checks="unreadable") in page
+    assert step_row(3, checks="") in page
+    assert "steps-unavailable" not in page
+
+
+# ----------------------------------------------------- render_run_page: escaping
+
+
+def test_render_run_page_escapes_markup_in_the_request(viewer):
+    page = render_run(
+        viewer, run_detail(viewer, request="<script>alert(1)</script> & more")
+    )
+    assert (
+        '<dd id="run-request">&lt;script&gt;alert(1)&lt;/script&gt; &amp; more</dd>'
+        in page
+    )
+    assert "<script>" not in page
+
+
+def test_render_run_page_escapes_quotes_in_the_request(viewer):
+    request = "say \"hi\" to 'them'"
+    page = render_run(viewer, run_detail(viewer, request=request))
+    assert f'<dd id="run-request">{html.escape(request)}</dd>' in page
+    assert 'say "hi"' not in page
+
+
+def test_render_run_page_escapes_markup_in_the_target(viewer):
+    page = render_run(viewer, run_detail(viewer, target="/tmp/a&b <i>c</i>"))
+    assert '<dd id="run-target">/tmp/a&amp;b &lt;i&gt;c&lt;/i&gt;</dd>' in page
+    assert "<i>" not in page
+    assert "a&b" not in page
+
+
+def test_render_run_page_escapes_markup_in_the_branch(viewer):
+    page = render_run(viewer, run_detail(viewer, branch='factory/7-<b>"x"&y'))
+    assert (
+        '<dd id="run-branch">' + html.escape('factory/7-<b>"x"&y') + "</dd>" in page
+    )
+    assert "<b>" not in page
+
+
+def test_render_run_page_escapes_markup_in_the_outcome(viewer):
+    page = render_run(viewer, run_detail(viewer, outcome="<b>&"))
+    assert '<dt>Outcome</dt><dd id="run-status">&lt;b&gt;&amp;</dd>' in page
+    assert "<b>" not in page
+
+
+def test_render_run_page_escapes_markup_in_the_state(viewer):
+    state = '<i>"working"</i>'
+    page = render_run(viewer, running_detail(viewer, state=state))
+    assert '<dt>State</dt><dd id="run-status">' + html.escape(state) + "</dd>" in page
+    assert "<i>" not in page
+
+
+def test_render_run_page_escapes_markup_in_the_reason(viewer):
+    page = render_run(
+        viewer, run_detail(viewer, reason="<script>alert(1)</script> & 'more'")
+    )
+    assert (
+        '<dd id="run-reason">'
+        + html.escape("<script>alert(1)</script> & 'more'")
+        + "</dd>"
+        in page
+    )
+    assert "<script>" not in page
+
+
+def test_render_run_page_escapes_markup_in_a_step_name(viewer):
+    step = step_summary(viewer, name='<b>te&st</b> "x"')
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert (
+        '<td class="step-name">' + html.escape('<b>te&st</b> "x"') + "</td>" in page
+    )
+    assert "<b>" not in page
+
+
+def test_render_run_page_escapes_markup_in_a_step_persona(viewer):
+    step = step_summary(viewer, persona="<i>tester</i> & co")
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert '<td class="step-persona">&lt;i&gt;tester&lt;/i&gt; &amp; co</td>' in page
+    assert "<i>" not in page
+
+
+def test_render_run_page_escapes_markup_in_a_passed_check_name(viewer):
+    step = step_summary(viewer, checks=(viewer.Check("<b>guard</b> & 'co'", True),))
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert check_span(html.escape("<b>guard</b> & 'co'")) in page
+    assert "<b>" not in page
+
+
+def test_render_run_page_escapes_markup_in_a_failed_check_name(viewer):
+    step = step_summary(
+        viewer, passed=False, checks=(viewer.Check('</span><script>x</script>"', False),)
+    )
+    page = render_run(viewer, run_detail(viewer), [step])
+    assert failed_check_span(html.escape('</span><script>x</script>"')) in page
+    assert "<script>" not in page
+    assert page.count("</span>") == 1
+
+
+def test_render_run_page_escapes_every_stored_text_at_once(viewer):
+    nasty = "<u>&\"'"
+    run = run_detail(
+        viewer, request=nasty, target=nasty, branch=nasty, outcome=nasty, reason=nasty
+    )
+    step = step_summary(
+        viewer,
+        name=nasty,
+        persona=nasty,
+        passed=False,
+        checks=(viewer.Check(nasty, True), viewer.Check(nasty, False)),
+    )
+    page = render_run(viewer, run, [step])
+    assert "<u>" not in page
+    assert nasty not in page
+    assert page.count(html.escape(nasty)) == 9
+
+
+# ------------------------------ render_run_page does not read database or clock
+
+
+def test_render_run_page_does_not_open_the_database_or_look_up_its_path(
+    viewer, home, monkeypatch
+):
+    make_run_db(
+        home, runs=[{"request": "from the database"}], steps=[{"name": "stored-step"}]
+    )
+
+    def forbidden_connect(*args, **kwargs):
+        raise AssertionError("render_run_page must not open the database")
+
+    def forbidden_db_path():
+        raise AssertionError("render_run_page must not look up the database path")
+
+    monkeypatch.setattr(viewer.sqlite3, "connect", forbidden_connect)
+    monkeypatch.setattr(viewer, "db_path", forbidden_db_path)
+
+    page = render_run(
+        viewer,
+        run_detail(viewer, request="given by the caller"),
+        [step_summary(viewer, name="given-step")],
+    )
+    assert '<dd id="run-request">given by the caller</dd>' in page
+    assert '<td class="step-name">given-step</td>' in page
+    assert "from the database" not in page
+    assert "stored-step" not in page
+
+    assert NO_STEPS_LINE in render_run(viewer, run_detail(viewer), [])
+    assert STEPS_UNAVAILABLE_LINE in render_run(
+        viewer, run_detail(viewer), viewer.UNREADABLE
+    )
+    assert RUN_UNAVAILABLE_LINE in render_run(
+        viewer, viewer.UNREADABLE, viewer.UNREADABLE
+    )
+    assert run_not_found_line(7) in render_run(viewer, None, ())
+
+
+def test_render_run_page_told_the_run_was_not_found_ignores_the_run_in_the_database(
+    viewer, home
+):
+    make_run_db(home, runs=[{"request": "from the database"}], steps=[{}])
+    page = render_run(viewer, None, ())
+    assert run_not_found_line(7) in page
+    assert "from the database" not in page
+    assert "<table" not in page
+
+
+def test_render_run_page_with_no_steps_ignores_steps_in_the_database(viewer, home):
+    make_run_db(home, runs=[{}], steps=[{"name": "stored-step"}])
+    page = render_run(viewer, run_detail(viewer), [])
+    assert NO_STEPS_LINE in page
+    assert "stored-step" not in page
+
+
+# --------------------------------------- render_runs_page: the link to each run
+
+
+def test_render_runs_page_links_each_id_to_the_page_of_its_run(viewer):
+    runs = [ended_summary(viewer, run_id=n) for n in (12, 9, 5)]
+    page = render_runs(viewer, runs)
+    assert re.findall(
+        r'<tr id="run-(\d+)"><td class="run-id"><a href="([^"]*)">([^<]*)</a></td>',
+        page,
+    ) == [("12", "/runs/12", "12"), ("9", "/runs/9", "9"), ("5", "/runs/5", "5")]
+    assert page.count("<a ") == 3
+
+
+def test_render_runs_page_links_a_running_run_to_its_page(viewer):
+    page = render_runs(viewer, [running_summary(viewer, run_id=7)])
+    assert '<td class="run-id"><a href="/runs/7">7</a></td>' in page
+
+
+def test_render_runs_page_has_no_links_when_there_are_no_runs(viewer):
+    assert "<a " not in render_runs(viewer, [])
+    assert "href" not in viewer.render_runs_page(
+        viewer.RunsPageData(viewer.UNREADABLE, ENDED_DT)
+    )
+    # The link exists once there is a run to link to.
+    assert 'href="/runs/7"' in render_runs(viewer, [ended_summary(viewer)])
+
+
+# -------------------------------------------------------- HTTP server, /runs/<id>
+
+
+def test_get_run_page_returns_200_html_in_utf8(home, port):
+    make_run_db(home, runs=[{}], steps=[{}])
+    status, headers, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert headers["Content-Type"].replace(" ", "").lower() == "text/html;charset=utf-8"
+    assert "<h1>Run 7</h1>" in body.decode("utf-8")
+
+
+def test_get_run_page_content_length_matches_body(home, port):
+    make_run_db(home, runs=[{}], steps=[{}])
+    status, headers, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert headers["Content-Length"] is not None
+    assert int(headers["Content-Length"]) == len(body)
+    assert len(body) > 0
+
+
+def test_get_run_page_content_length_matches_body_with_non_ascii_text(home, port):
+    make_run_db(home, runs=[{"request": "café ✓", "reason": "terminé ✓"}])
+    status, headers, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert '<dd id="run-request">café ✓</dd>' in body.decode("utf-8")
+    assert int(headers["Content-Length"]) == len(body)
+    assert len(body) > len(body.decode("utf-8"))
+
+
+def test_get_run_page_body_is_the_run_page_rendered_from_the_run_page_data(
+    viewer, home, port
+):
+    # The run has ended and every step has finished, so the page does not depend on
+    # when it was read.
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {"name": "red", "checks": checks_json(("guard", True))},
+            {
+                "name": "test",
+                "attempt": 2,
+                "passed": 0,
+                "checks": checks_json(("guard", True), ("tests", False)),
+            },
+        ],
+    )
+    status, _, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert body.decode("utf-8") == viewer.render_run_page(viewer.read_run_page_data(7))
+    assert b'<table id="steps">' in body
+
+
+def test_get_run_page_shows_the_run_and_its_steps(home, port):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {
+                "step_id": 11,
+                "name": "red",
+                "persona": "test-writer",
+                "checks": checks_json(("guard", True)),
+            },
+            {
+                "step_id": 12,
+                "attempt": 2,
+                "passed": 0,
+                "checks": checks_json(("guard", True), ("tests", False)),
+            },
+        ],
+    )
+    status, _, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert body.decode("utf-8") == (
+        RUN_7_HEAD
+        + run_facts()
+        + STEPS_TABLE_OPEN
+        + step_row(11, "red", "test-writer", 1, "3m 7s", "passed", check_span("guard"))
+        + step_row(
+            12,
+            "test",
+            "tester",
+            2,
+            "3m 7s",
+            "failed",
+            check_span("guard") + ", " + failed_check_span("tests"),
+        )
+        + STEPS_TABLE_CLOSE
+        + DOCUMENT_TAIL
+    )
+
+
+def test_get_run_page_shows_the_run_named_by_the_id_in_the_path(home, port):
+    make_run_db(
+        home,
+        runs=[
+            {"run_id": 5, "request": "the fifth request"},
+            {"run_id": 12, "request": "the twelfth request"},
+        ],
+        steps=[
+            {"run_id": 5, "name": "step-of-five"},
+            {"run_id": 12, "name": "step-of-twelve"},
+        ],
+    )
+    status, _, body = fetch(port, "/runs/12")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert "<h1>Run 12</h1>" in text
+    assert '<dd id="run-request">the twelfth request</dd>' in text
+    assert "step-of-twelve" in text
+    assert "the fifth request" not in text
+    assert "step-of-five" not in text
+
+
+def test_get_run_page_lists_steps_in_id_order(home, port):
+    make_run_db(
+        home, runs=[{}], steps=[{"step_id": 30}, {"step_id": 4}, {"step_id": 12}]
+    )
+    _, _, body = fetch(port, "/runs/7")
+    assert re.findall(r'<tr id="step-(\d+)">', body.decode("utf-8")) == [
+        "4",
+        "12",
+        "30",
+    ]
+
+
+def test_get_run_page_shows_a_running_run_with_its_state_and_an_unfinished_step(
+    home, port
+):
+    make_run_db(
+        home,
+        runs=[{"reason": None, "created_at": "2020-01-01T00:00:00Z", **RUNNING}],
+        steps=[
+            {"step_id": 1, "name": "plan"},
+            {
+                "step_id": 2,
+                "name": "build",
+                "started_at": "2020-01-01T00:00:00Z",
+                **UNFINISHED,
+            },
+        ],
+    )
+    status, _, body = fetch(port, "/runs/7")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert '<dt>State</dt><dd id="run-status">working</dd>\n' in text
+    assert "run-reason" not in text
+    assert re.search(
+        r'<tr id="step-2"><td class="step-name">build</td>'
+        r'<td class="step-persona">tester</td>'
+        r'<td class="step-attempt">1</td>'
+        r'<td class="step-duration">\d+d \d+h \d+m \d+s so far</td>'
+        r'<td class="step-result">not finished</td>'
+        r'<td class="step-checks"></td></tr>\n',
+        text,
+    )
+    assert step_row(1, name="plan") in text
+    assert text.count("so far") == 1
+
+
+def test_get_run_page_shows_durations_of_steps_stored_with_milliseconds(home, port):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {
+                "started_at": "2026-11-18T21:04:05.123Z",
+                "ended_at": "2026-11-18T21:07:12.623Z",
+            }
+        ],
+    )
+    status, _, body = fetch(port, "/runs/7")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert step_duration_cell("3m 7s") in text
+    assert "unknown" not in text
+
+
+def test_get_run_page_says_no_steps_recorded_yet_for_a_run_without_steps(home, port):
+    make_run_db(home, runs=[{}])
+    status, _, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert body.decode("utf-8") == (
+        RUN_7_HEAD + run_facts() + NO_STEPS_LINE + DOCUMENT_TAIL
+    )
+
+
+def test_get_run_page_says_unreadable_for_one_steps_bad_checks_and_shows_the_rest(
+    home, port
+):
+    make_run_db(
+        home,
+        runs=[{}],
+        steps=[
+            {"step_id": 1, "checks": checks_json(("guard", True))},
+            {"step_id": 2, "checks": "not json"},
+        ],
+    )
+    status, _, body = fetch(port, "/runs/7")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert step_row(1, checks=check_span("guard")) in text
+    assert step_row(2, checks="unreadable") in text
+    assert "steps-unavailable" not in text
+
+
+def test_get_run_page_escapes_markup_in_stored_text(home, port):
+    make_run_db(
+        home,
+        runs=[
+            {
+                "request": "<script>alert(1)</script> & more",
+                "target": "/tmp/<i>",
+                "branch": "factory/<b>",
+                "reason": "<u>why</u>",
+            }
+        ],
+        steps=[
+            {
+                "name": "<em>test</em>",
+                "persona": "<s>tester</s>",
+                "checks": checks_json(("<q>guard</q>", False)),
+            }
+        ],
+    )
+    status, _, body = fetch(port, "/runs/7")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert (
+        '<dd id="run-request">&lt;script&gt;alert(1)&lt;/script&gt; &amp; more</dd>'
+        in text
+    )
+    assert failed_check_span("&lt;q&gt;guard&lt;/q&gt;") in text
+    for tag in ("<script>", "<i>", "<b>", "<u>", "<em>", "<s>", "<q>"):
+        assert tag not in text
+
+
+def test_get_run_page_ignores_the_query_string(home, port):
+    make_run_db(home, runs=[{}], steps=[{}])
+    status, _, body = fetch(port, "/runs/7?x=1")
+    assert status == 200
+    assert body == fetch(port, "/runs/7")[2]
+    assert b"<h1>Run 7</h1>" in body
+
+
+def test_get_run_page_opens_one_read_only_connection_per_request(
+    viewer, home, port, monkeypatch
+):
+    make_run_db(home, runs=[{}], steps=[{}, {}])
+    calls = record_connects(viewer, monkeypatch)
+
+    status, _, body = fetch(port, "/runs/7")
+
+    assert status == 200
+    assert body.decode("utf-8").count('<tr id="step-') == 2
+    assert_one_read_only_connect(calls)
+
+
+def test_get_run_page_twice_returns_the_same_page_for_an_ended_run(home, port):
+    make_run_db(home, runs=[{}], steps=[{}, {"passed": 0}])
+    first = fetch(port, "/runs/7")
+    second = fetch(port, "/runs/7")
+    assert first[0] == second[0] == 200
+    assert first[2] == second[2]
+    assert b'<table id="steps">' in first[2]
+
+
+def test_get_run_page_shows_a_step_started_between_two_requests(home, port):
+    path = make_run_db(home, runs=[{"reason": None, **RUNNING}], steps=[{}])
+    _, _, first = fetch(port, "/runs/7")
+    assert re.findall(r'<tr id="step-(\d+)">', first.decode("utf-8")) == ["1"]
+
+    insert_step(path, name="build", **UNFINISHED)
+
+    status, _, second = fetch(port, "/runs/7")
+    text = second.decode("utf-8")
+    assert status == 200
+    assert re.findall(r'<tr id="step-(\d+)">', text) == ["1", "2"]
+    assert '<td class="step-result">not finished</td>' in text
+
+
+def test_get_run_page_shows_the_result_once_an_unfinished_step_has_finished(
+    home, port
+):
+    path = make_run_db(
+        home, runs=[{"reason": None, **RUNNING}], steps=[{"step_id": 12, **UNFINISHED}]
+    )
+    _, _, first = fetch(port, "/runs/7")
+    assert '<td class="step-result">not finished</td>' in first.decode("utf-8")
+
+    execute_sql(
+        path,
+        "UPDATE steps SET passed = 0, ended_at = ?, checks = ? WHERE id = 12",
+        (ENDED, checks_json(("tests", False))),
+    )
+
+    _, _, second = fetch(port, "/runs/7")
+    text = second.decode("utf-8")
+    assert (
+        step_row(12, result="failed", checks=failed_check_span("tests")) in text
+    )
+    assert "so far" not in text
+    assert "not finished" not in text
+
+
+def test_get_run_page_shows_the_outcome_and_reason_once_the_run_has_ended(home, port):
+    path = make_run_db(home, runs=[{"reason": None, **RUNNING}])
+    _, _, first = fetch(port, "/runs/7")
+    assert '<dt>State</dt><dd id="run-status">working</dd>' in first.decode("utf-8")
+
+    execute_sql(
+        path,
+        "UPDATE runs SET state = 'ended', outcome = 'needs-me', "
+        "reason = 'interrupted', ended_at = ?",
+        (ENDED,),
+    )
+
+    _, _, second = fetch(port, "/runs/7")
+    text = second.decode("utf-8")
+    assert run_facts(status="needs-me", reason="interrupted") in text
+    assert "<dt>State</dt>" not in text
+
+
+def test_get_run_page_leaves_the_database_file_unchanged(home, port):
+    path = make_run_db(home, runs=[{}], steps=[{}, {"checks": "not json"}])
+    before = path.read_bytes()
+    status, _, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert body.decode("utf-8").count('<tr id="step-') == 2
+    assert path.read_bytes() == before
+    assert [p.name for p in home.iterdir()] == ["factory.db"]
+
+
+def test_get_run_page_does_not_show_the_home_page_or_the_runs_page(home, port):
+    make_run_db(home, runs=[{}], steps=[{}])
+    status, _, body = fetch(port, "/runs/7")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert "<title>Run 7 - tomfactory viewer</title>" in text
+    assert "Hello from the factory" not in text
+    assert "<h1>Runs</h1>" not in text
+    assert '<table id="runs">' not in text
+
+
+# ------------------------------------------- HTTP server, /runs/<id>: an unknown id
+
+
+def test_get_run_page_for_an_unknown_id_returns_404_with_the_run_not_found_page(
+    viewer, home, port
+):
+    make_run_db(home, runs=[{}], steps=[{}])
+    status, headers, body = fetch(port, "/runs/99")
+    text = body.decode("utf-8")
+    assert status == 404
+    assert headers["Content-Type"].replace(" ", "").lower() == "text/html;charset=utf-8"
+    assert 'id="run-not-found"' in text
+    assert text == RUN_NOT_FOUND_HEAD + run_not_found_line(99) + DOCUMENT_TAIL
+    assert text == viewer.render_run_page(viewer.RunPageData(99, None, (), ENDED_DT))
+
+
+def test_get_run_page_for_an_unknown_id_content_length_matches_body(home, port):
+    make_run_db(home, runs=[{}])
+    status, headers, body = fetch(port, "/runs/99")
+    assert status == 404
+    assert b'id="run-not-found"' in body
+    assert headers["Content-Length"] is not None
+    assert int(headers["Content-Length"]) == len(body)
+
+
+def test_get_run_page_for_an_unknown_id_does_not_show_another_run(home, port):
+    make_run_db(home, runs=[{"request": "the only request"}], steps=[{"name": "only"}])
+    status, _, body = fetch(port, "/runs/99")
+    text = body.decode("utf-8")
+    assert status == 404
+    assert run_not_found_line(99) in text
+    assert "the only request" not in text
+    assert "<table" not in text
+
+
+def test_get_run_page_returns_404_for_any_id_when_the_runs_table_is_empty(home, port):
+    make_run_db(home)
+    status, _, body = fetch(port, "/runs/1")
+    assert status == 404
+    assert run_not_found_line(1) in body.decode("utf-8")
+
+
+def test_get_run_page_for_the_largest_accepted_id_returns_the_run_not_found_page(
+    home, port
+):
+    make_run_db(home, runs=[{}])
+    status, _, body = fetch(port, "/runs/999999999999999999")
+    assert status == 404
+    assert run_not_found_line(999999999999999999) in body.decode("utf-8")
+
+
+def test_get_run_page_for_an_unknown_id_ignores_the_query_string(home, port):
+    make_run_db(home, runs=[{}])
+    status, _, body = fetch(port, "/runs/99?x=1")
+    assert status == 404
+    assert run_not_found_line(99) in body.decode("utf-8")
+
+
+def test_get_run_page_for_an_unknown_id_opens_one_read_only_connection(
+    viewer, home, port, monkeypatch
+):
+    make_run_db(home, runs=[{}])
+    calls = record_connects(viewer, monkeypatch)
+
+    status, _, body = fetch(port, "/runs/99")
+
+    assert status == 404
+    assert b'id="run-not-found"' in body
+    assert_one_read_only_connect(calls)
+
+
+def test_get_run_page_returns_200_once_the_unknown_run_has_been_inserted(home, port):
+    path = make_run_db(home)
+    status, _, before = fetch(port, "/runs/7")
+    assert status == 404
+    assert run_not_found_line(7) in before.decode("utf-8")
+
+    insert_detail_run(path)
+
+    status, _, after = fetch(port, "/runs/7")
+    assert status == 200
+    assert run_facts() in after.decode("utf-8")
+
+
+def test_server_still_serves_every_page_after_a_run_not_found(home, port):
+    make_run_db(home, runs=[{}])
+    status, _, body = fetch(port, "/runs/99")
+    assert status == 404
+    assert b'id="run-not-found"' in body
+    assert fetch(port, "/runs/7")[0] == 200
+    assert fetch(port, "/runs")[0] == 200
+    assert fetch(port, "/")[0] == 200
+
+
+# --------------------------------------- HTTP server, /runs/<id>: paths that are not ids
+
+NOT_RUN_PAGE_PATHS = [
+    pytest.param("/runs/", id="no_id"),
+    pytest.param("/runs/abc", id="letters"),
+    pytest.param("/runs/0", id="zero"),
+    pytest.param("/runs/07", id="a_leading_zero"),
+    pytest.param("/runs/007", id="two_leading_zeros"),
+    pytest.param("/runs/7/", id="a_trailing_slash"),
+    pytest.param("/runs/1234567890123456789", id="nineteen_digits"),
+    pytest.param("/runs/-7", id="a_negative_number"),
+    pytest.param("/runs/+7", id="a_plus_sign"),
+    pytest.param("/runs/7.0", id="a_decimal_point"),
+    pytest.param("/runs/7abc", id="digits_then_letters"),
+    pytest.param("/runs/abc7", id="letters_then_digits"),
+    pytest.param("/runs/0x7", id="hexadecimal"),
+    pytest.param("/runs/7/steps", id="a_path_below_the_run"),
+    pytest.param("/runs//7", id="a_doubled_slash"),
+    pytest.param("/runs/7/?x=1", id="a_trailing_slash_and_a_query_string"),
+    pytest.param("/Runs/7", id="a_capital_letter"),
+    pytest.param("/run/7", id="run_in_the_singular"),
+    pytest.param("/7", id="the_id_alone"),
+]
+
+
+@pytest.mark.parametrize("path", NOT_RUN_PAGE_PATHS)
+def test_get_run_page_is_not_served_and_the_database_is_not_opened_at(
+    viewer, home, port, monkeypatch, path
+):
+    make_run_db(home, runs=[{"run_id": 7}], steps=[{}])
+    assert fetch(port, "/runs/7")[0] == 200
+    calls = record_connects(viewer, monkeypatch)
+
+    status, _, body = fetch(port, path)
+
+    assert status == 404
+    assert calls == []
+    assert b"run-not-found" not in body
+    assert b'id="run"' not in body
+    assert b"<h1>Run 7</h1>" not in body
+
+
+def test_get_run_page_accepts_an_id_of_eighteen_digits_but_not_of_nineteen(
+    viewer, home, port, monkeypatch
+):
+    make_run_db(home, runs=[{}])
+    calls = record_connects(viewer, monkeypatch)
+
+    status, _, body = fetch(port, "/runs/100000000000000000")
+    assert status == 404
+    assert run_not_found_line(100000000000000000) in body.decode("utf-8")
+    assert_one_read_only_connect(calls)
+
+    status, _, body = fetch(port, "/runs/1000000000000000000")
+    assert status == 404
+    assert b"run-not-found" not in body
+    assert len(calls) == 1
+
+
+def test_get_run_page_serves_a_run_whose_id_has_several_digits(home, port):
+    make_run_db(home, runs=[{"run_id": 1070}])
+    status, _, body = fetch(port, "/runs/1070")
+    assert status == 200
+    assert "<h1>Run 1070</h1>" in body.decode("utf-8")
+
+
+# ------------------------------------- HTTP server, /runs/<id>: unreadable database
+
+
+def test_get_run_page_without_database_returns_200_with_run_unavailable(home, port):
+    status, headers, body = fetch(port, "/runs/7")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    assert text == RUN_7_HEAD + RUN_UNAVAILABLE_LINE + DOCUMENT_TAIL
+    assert int(headers["Content-Length"]) == len(body)
+
+
+def test_get_run_page_without_database_does_not_create_it(home, port):
+    status, _, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert RUN_UNAVAILABLE_LINE in body.decode("utf-8")
+    assert not (home / "factory.db").exists()
+    assert list(home.iterdir()) == []
+
+
+@pytest.mark.parametrize("break_database", UNREADABLE_RUN_DATABASES)
+def test_get_run_page_returns_200_with_run_unavailable_when(
+    home, port, break_database
+):
+    break_database(home)
+    status, _, body = fetch(port, "/runs/7")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert RUN_UNAVAILABLE_LINE in text
+    assert "run-not-found" not in text
+    assert "<table" not in text
+    assert 'id="run"' not in text
+
+
+@pytest.mark.parametrize("break_steps", UNREADABLE_STEPS_DATABASES)
+def test_get_run_page_returns_200_with_the_run_and_steps_unavailable_when(
+    home, port, break_steps
+):
+    break_steps(home)
+    status, _, body = fetch(port, "/runs/7")
+    assert status == 200
+    assert body.decode("utf-8") == (
+        RUN_7_HEAD + run_facts() + STEPS_UNAVAILABLE_LINE + DOCUMENT_TAIL
+    )
+
+
+def test_get_run_page_for_an_unknown_id_returns_404_when_the_steps_table_is_missing(
+    home, port
+):
+    _make_run_without_steps_table(home)
+    status, _, body = fetch(port, "/runs/99")
+    text = body.decode("utf-8")
+    assert status == 404
+    assert run_not_found_line(99) in text
+    assert "unavailable" not in text
+
+
+def test_get_run_page_recovers_once_the_database_appears(home, port):
+    _, _, before = fetch(port, "/runs/7")
+    assert RUN_UNAVAILABLE_LINE in before.decode("utf-8")
+
+    make_run_db(home, runs=[{}], steps=[{}])
+
+    status, _, after = fetch(port, "/runs/7")
+    text = after.decode("utf-8")
+    assert status == 200
+    assert run_facts() in text
+    assert step_row(1) in text
+    assert "unavailable" not in text
+
+
+# --------------------------------------- HTTP server, the links from /runs to each run
+
+
+def test_get_runs_links_every_run_to_its_page(home, port):
+    make_run_db(home, runs=[{"run_id": 5}, {"run_id": 12}, {"run_id": 9, **RUNNING}])
+    status, _, body = fetch(port, "/runs")
+    text = body.decode("utf-8")
+    assert status == 200
+    assert re.findall(
+        r'<tr id="run-(\d+)"><td class="run-id"><a href="([^"]*)">([^<]*)</a></td>',
+        text,
+    ) == [("12", "/runs/12", "12"), ("9", "/runs/9", "9"), ("5", "/runs/5", "5")]
+    assert text.count('<tr id="run-') == 3
+    assert text.count("<a ") == 3
+
+
+def test_following_the_link_of_every_run_on_the_runs_page_answers_200(home, port):
+    make_run_db(
+        home,
+        runs=[{"run_id": 5}, {"run_id": 12}, {"run_id": 9, **RUNNING}],
+        steps=[{"run_id": 12}],
+    )
+    _, _, runs_body = fetch(port, "/runs")
+    links = re.findall(
+        r'<td class="run-id"><a href="([^"]+)">(\d+)</a></td>',
+        runs_body.decode("utf-8"),
+    )
+    assert [run_id for _, run_id in links] == ["12", "9", "5"]
+    for href, run_id in links:
+        status, _, body = fetch(port, href)
+        assert status == 200
+        assert f"<h1>Run {run_id}</h1>" in body.decode("utf-8")
+
+
+def test_the_runs_link_on_the_home_page_leads_on_to_the_page_of_a_run(home, port):
+    make_run_db(home, runs=[{"request": "reached from the home page"}])
+    _, _, home_body = fetch(port)
+    runs_link = re.search(
+        r'<a id="runs-link" href="([^"]+)">', home_body.decode("utf-8")
+    )
+    assert runs_link is not None
+    _, _, runs_body = fetch(port, runs_link.group(1))
+    run_link = re.search(
+        r'<td class="run-id"><a href="([^"]+)">7</a></td>', runs_body.decode("utf-8")
+    )
+    assert run_link is not None
+    status, _, run_body = fetch(port, run_link.group(1))
+    assert status == 200
+    assert (
+        '<dd id="run-request">reached from the home page</dd>'
+        in run_body.decode("utf-8")
+    )
