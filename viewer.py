@@ -1,18 +1,22 @@
 """Hello-world observability pages for the factory.
 
-Serves two pages. The home page, at ``/``, says hello and shows how many runs
+Serves three pages. The home page, at ``/``, says hello and shows how many runs
 the factory has recorded, plus the outcome and reason of the most recent run.
-The runs page, at ``/runs``, lists every run, newest first. Uses only the
-Python standard library.
+The runs page, at ``/runs``, lists every run, newest first. The run page, at
+``/runs/<id>``, shows one run and its steps. Uses only the Python standard
+library.
 
 There are three layers: data (``read_*``), presentation (``render_*``) and HTTP
-(``_Handler``). The data layer hands the presentation layer one ``PageData`` or
-``RunsPageData``; the presentation layer never reads the database or the clock.
+(``_Handler``). The data layer hands the presentation layer one ``PageData``,
+``RunsPageData`` or ``RunPageData``; the presentation layer never reads the
+database or the clock.
 """
 
 import argparse
 import html
+import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -92,20 +96,106 @@ class RunsPageData(NamedTuple):
     read_at: datetime  # UTC-aware; when the read was made
 
 
+class Check(NamedTuple):
+    """One check the factory ran on a step."""
+
+    name: str
+    passed: bool
+
+
+class StepSummary(NamedTuple):
+    """What the run page knows about one step, and the rules that follow from it."""
+
+    id: int
+    name: str
+    persona: str  # "" when the step has none
+    attempt: int
+    started_at: datetime | None  # UTC-aware; None if it could not be parsed
+    ended_at: datetime | None  # UTC-aware; None if absent or not parseable
+    passed: bool | None  # None until the step finishes
+    checks: tuple[Check, ...] | Unreadable  # in the order they ran; () if none stored
+
+    @property
+    def finished(self) -> bool:
+        """Whether the step has finished: it has a result."""
+        return self.passed is not None
+
+    def duration(self, now: datetime) -> timedelta | None:
+        """How long the step took, or has been running as of ``now``; None if unknown."""
+        if self.started_at is None:
+            return None
+        if self.finished:
+            if self.ended_at is None:
+                return None
+            span = self.ended_at - self.started_at
+        else:
+            span = now - self.started_at
+        return max(span, timedelta(0))
+
+
+class RunDetail(NamedTuple):
+    """What the run page knows about its run: the summary plus the rest."""
+
+    summary: RunSummary
+    target: str
+    branch: str  # "" when the run has none
+    reason: str  # "" when the run has none
+    attempt_limit: int
+
+
+class RunPageData(NamedTuple):
+    """Everything the run page shows: the data layer's hand-off to presentation."""
+
+    run_id: int  # the id asked for
+    run: RunDetail | None | Unreadable  # None only when ``runs`` has no such row
+    steps: tuple[StepSummary, ...] | Unreadable  # in the order to show them
+    read_at: datetime  # UTC-aware; when the read was made
+
+
 def _connect() -> sqlite3.Connection:
     """Open the factory database read-only, so it is never created or changed."""
     return sqlite3.connect(db_path().resolve().as_uri() + "?mode=ro", uri=True)
+
+
+# The forms a stored timestamp takes: whole seconds, or with a fraction of a second.
+_TIME_FORMATS = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _parse_time(value) -> datetime | None:
     """Return the UTC-aware time a stored timestamp names, or None if it names none."""
     if not isinstance(value, str):
         return None
+    for time_format in _TIME_FORMATS:
+        try:
+            parsed = datetime.strptime(value, time_format)
+        except ValueError:
+            continue
+        return parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _parse_checks(value) -> tuple[Check, ...] | Unreadable:
+    """Return the checks a stored ``steps.checks`` value names; ``()`` for NULL."""
+    if value is None:
+        return ()
+    if not isinstance(value, str):
+        return UNREADABLE
     try:
-        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
-    except ValueError:
-        return None
-    return parsed.replace(tzinfo=timezone.utc)
+        items = json.loads(value)
+    except (ValueError, RecursionError):
+        return UNREADABLE
+    if not isinstance(items, list):
+        return UNREADABLE
+    checks = []
+    for item in items:
+        if not isinstance(item, dict):
+            return UNREADABLE
+        name = item.get("name")
+        passed = item.get("passed")
+        if not isinstance(name, str) or not isinstance(passed, bool):
+            return UNREADABLE
+        checks.append(Check(name, passed))
+    return tuple(checks)
 
 
 def read_page_data() -> PageData:
@@ -179,6 +269,73 @@ def read_runs_page_data() -> RunsPageData:
         for row in rows
     )
     return RunsPageData(runs, read_at)
+
+
+def read_run_page_data(run_id: int) -> RunPageData:
+    """Read one run and its steps, lowest step id first, over one read-only connection.
+
+    Both are read inside one read transaction, so they describe the same moment.
+    If the run could not be read, ``run`` and ``steps`` are both ``UNREADABLE``.
+    ``run`` is None only when the ``runs`` table was read and has no row with that
+    id; the steps are then not read and ``steps`` is empty. If only the steps could
+    not be read, the run is kept and ``steps`` is ``UNREADABLE``.
+    """
+    read_at = datetime.now(timezone.utc)
+    try:
+        conn = _connect()
+    except sqlite3.Error:
+        return RunPageData(run_id, UNREADABLE, UNREADABLE, read_at)
+    try:
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT id, state, outcome, request, created_at, ended_at, "
+                "target, branch, reason, attempt_limit FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return RunPageData(run_id, UNREADABLE, UNREADABLE, read_at)
+        if row is None:
+            return RunPageData(run_id, None, (), read_at)
+        run = RunDetail(
+            RunSummary(
+                row[0],
+                row[1] or "",
+                row[2] or "",
+                row[3] or "",
+                _parse_time(row[4]),
+                _parse_time(row[5]),
+            ),
+            row[6] or "",
+            row[7] or "",
+            row[8] or "",
+            row[9],
+        )
+
+        try:
+            step_rows = conn.execute(
+                "SELECT id, name, persona, attempt, started_at, ended_at, passed, "
+                "checks FROM steps WHERE run_id = ? ORDER BY id",
+                (run_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            return RunPageData(run_id, run, UNREADABLE, read_at)
+    finally:
+        conn.close()
+    steps = tuple(
+        StepSummary(
+            step[0],
+            step[1] or "",
+            step[2] or "",
+            step[3],
+            _parse_time(step[4]),
+            _parse_time(step[5]),
+            None if step[6] is None else bool(step[6]),
+            _parse_checks(step[7]),
+        )
+        for step in step_rows
+    )
+    return RunPageData(run_id, run, steps, read_at)
 
 
 def _document(title: str, body: str) -> str:
@@ -274,7 +431,7 @@ def _render_run_row(run: RunSummary, read_at: datetime) -> str:
         duration += " so far"
     return (
         f'<tr id="run-{run.id}">'
-        f'<td class="run-id">{run.id}</td>'
+        f'<td class="run-id"><a href="/runs/{run.id}">{run.id}</a></td>'
         f'<td class="run-status">{html.escape(run.status)}</td>'
         f'<td class="run-request">{html.escape(_first_words(run.request))}</td>'
         f'<td class="run-created">{_format_time(run.created_at)}</td>'
@@ -308,21 +465,145 @@ def render_runs_page(data: RunsPageData) -> str:
     return _document("Runs - tomfactory viewer", "<h1>Runs</h1>\n" + listing)
 
 
-# Every path served, and how its page is made. Any other path is a 404.
-_PAGES = {
-    "/": lambda: render_page(read_page_data()),
-    "/runs": lambda: render_runs_page(read_runs_page_data()),
-}
+def _render_check(check: Check) -> str:
+    """Return one check's name, marked if the check failed."""
+    name = html.escape(check.name)
+    if check.passed:
+        return f'<span class="check">{name}</span>'
+    return f'<span class="check check-failed">{name} (failed)</span>'
+
+
+def _render_step_row(step: StepSummary, read_at: datetime) -> str:
+    """Return the table line for one step, ending in a newline."""
+    span = step.duration(read_at)
+    duration = _format_duration(span)
+    if span is not None and not step.finished:
+        duration += " so far"
+    if step.passed is None:
+        result = "not finished"
+    else:
+        result = "passed" if step.passed else "failed"
+    if step.checks is UNREADABLE:
+        checks = "unreadable"
+    else:
+        checks = ", ".join(_render_check(check) for check in step.checks)
+    return (
+        f'<tr id="step-{step.id}">'
+        f'<td class="step-name">{html.escape(step.name)}</td>'
+        f'<td class="step-persona">{html.escape(step.persona)}</td>'
+        f'<td class="step-attempt">{step.attempt}</td>'
+        f'<td class="step-duration">{duration}</td>'
+        f'<td class="step-result">{result}</td>'
+        f'<td class="step-checks">{checks}</td>'
+        "</tr>\n"
+    )
+
+
+def _render_steps(steps: tuple[StepSummary, ...] | Unreadable, read_at: datetime) -> str:
+    """Return the page lines for a run's steps, each ending in a newline."""
+    if steps is UNREADABLE:
+        return (
+            '<p id="steps-unavailable">Steps unavailable: '
+            "could not read the steps table</p>\n"
+        )
+    if not steps:
+        return '<p id="no-steps">No steps recorded yet</p>\n'
+    return (
+        '<table id="steps">\n'
+        "<thead>\n"
+        "<tr><th>Name</th><th>Persona</th><th>Attempt</th><th>Duration</th>"
+        "<th>Result</th><th>Checks</th></tr>\n"
+        "</thead>\n"
+        "<tbody>\n"
+        + "".join(_render_step_row(step, read_at) for step in steps)
+        + "</tbody>\n"
+        "</table>\n"
+    )
+
+
+def _render_run_facts(run: RunDetail) -> str:
+    """Return the page lines describing the run itself, each ending in a newline."""
+    summary = run.summary
+    label = "Outcome" if summary.ended else "State"
+    lines = (
+        '<dl id="run">\n'
+        f'<dt>Request</dt><dd id="run-request">{html.escape(summary.request)}</dd>\n'
+        f'<dt>Target</dt><dd id="run-target">{html.escape(run.target)}</dd>\n'
+        f'<dt>Branch</dt><dd id="run-branch">{html.escape(run.branch) or "none"}</dd>\n'
+        f'<dt>{label}</dt><dd id="run-status">{html.escape(summary.status)}</dd>\n'
+    )
+    if summary.ended and run.reason != "":
+        lines += f'<dt>Reason</dt><dd id="run-reason">{html.escape(run.reason)}</dd>\n'
+    return (
+        lines
+        + f'<dt>Attempt limit</dt><dd id="run-attempt-limit">{run.attempt_limit}</dd>\n'
+        "</dl>\n"
+    )
+
+
+def render_run_page(data: RunPageData) -> str:
+    """Return the full HTML page for one run, its steps in the order given."""
+    run_id, run, steps, read_at = data
+    if run is None:
+        return _document(
+            "Run not found - tomfactory viewer",
+            "<h1>Run not found</h1>\n"
+            f'<p id="run-not-found">No run with id {run_id}</p>\n',
+        )
+    if run is UNREADABLE:
+        body = (
+            '<p id="run-unavailable">Run unavailable: '
+            "could not read the runs table</p>\n"
+        )
+    else:
+        body = _render_run_facts(run) + _render_steps(steps, read_at)
+    return _document(
+        f"Run {run_id} - tomfactory viewer", f"<h1>Run {run_id}</h1>\n" + body
+    )
+
+
+class Response(NamedTuple):
+    """What a route answers with: the HTTP status and the HTML body."""
+
+    status: int
+    body: str
+
+
+def _home_route() -> Response:
+    return Response(200, render_page(read_page_data()))
+
+
+def _runs_route() -> Response:
+    return Response(200, render_runs_page(read_runs_page_data()))
+
+
+def _run_route(run_id: str) -> Response:
+    data = read_run_page_data(int(run_id))
+    return Response(404 if data.run is None else 200, render_run_page(data))
+
+
+# Every path served, tried in order against the whole path. Each function takes the
+# pattern's groups as strings and returns a Response. Any other path is a 404.
+_ROUTES = (
+    (re.compile(r"/"), _home_route),
+    (re.compile(r"/runs"), _runs_route),
+    (re.compile(r"/runs/([1-9][0-9]{0,17})"), _run_route),
+)
 
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        page = _PAGES.get(self.path.split("?", 1)[0])
-        if page is None:
+        path = self.path.split("?", 1)[0]
+        for pattern, route in _ROUTES:
+            match = pattern.fullmatch(path)
+            if match is not None:
+                response = route(*match.groups())
+                break
+        else:
             self.send_error(404)
             return
-        body = page().encode("utf-8")
-        self.send_response(200)
+        body = response.body.encode("utf-8")
+        self.send_response(response.status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
