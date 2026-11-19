@@ -4,4 +4,5 @@ test_command = "python -m pytest -q -p no:cacheprovider"
 no_tests_exit_code = 5          # the test command's exit code for "no tests found"
 test_paths = ["tests/"]         # where tests live; only the test writer may change these
 docs_paths = ["docs/", "CHANGELOG.md"]   # where the documenter may write
-step_timeout_seconds = 900      # the time limit for any one step
+step_timeout_seconds = 2400     # the time limit for any one step
+test_budget_lines = 300         # the most lines of tests one run may add; 0 means no limit
