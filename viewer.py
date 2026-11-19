@@ -1,15 +1,16 @@
 """Hello-world observability pages for the factory.
 
-Serves three pages. The home page, at ``/``, says hello and shows how many runs
+Serves four pages. The home page, at ``/``, says hello and shows how many runs
 the factory has recorded, plus the outcome and reason of the most recent run.
 The runs page, at ``/runs``, lists every run, newest first. The run page, at
-``/runs/<id>``, shows one run and its steps. Uses only the Python standard
-library.
+``/runs/<id>``, shows one run and its steps. The step page, at
+``/runs/<id>/steps/<step id>``, shows one step in full: what it was asked, what
+it produced, its checks and its events. Uses only the Python standard library.
 
 There are three layers: data (``read_*``), presentation (``render_*``) and HTTP
 (``_Handler``). The data layer hands the presentation layer one ``PageData``,
-``RunsPageData`` or ``RunPageData``; the presentation layer never reads the
-database or the clock.
+``RunsPageData``, ``RunPageData`` or ``StepPageData``; the presentation layer
+never reads the database or the clock.
 """
 
 import argparse
@@ -101,6 +102,7 @@ class Check(NamedTuple):
 
     name: str
     passed: bool
+    note: str = ""  # why it failed, or its output; often "" when it passed
 
 
 class StepSummary(NamedTuple):
@@ -152,6 +154,33 @@ class RunPageData(NamedTuple):
     read_at: datetime  # UTC-aware; when the read was made
 
 
+class Event(NamedTuple):
+    """One thing the factory recorded happening during a step."""
+
+    id: int
+    at: datetime | None  # UTC-aware; None if it could not be parsed
+    kind: str
+    summary: str
+
+
+class StepDetail(NamedTuple):
+    """What the step page knows about its step: the summary plus the rest."""
+
+    summary: StepSummary
+    asked: str
+    produced: dict | Unreadable  # keys in stored order; {} if nothing is stored
+
+
+class StepPageData(NamedTuple):
+    """Everything the step page shows: the data layer's hand-off to presentation."""
+
+    run_id: int  # the run id asked for
+    step_id: int  # the step id asked for
+    step: StepDetail | None | Unreadable  # None only when that run has no such step
+    events: tuple[Event, ...] | Unreadable  # in the order to show them
+    read_at: datetime  # UTC-aware; when the read was made
+
+
 def _connect() -> sqlite3.Connection:
     """Open the factory database read-only, so it is never created or changed."""
     return sqlite3.connect(db_path().resolve().as_uri() + "?mode=ro", uri=True)
@@ -174,17 +203,26 @@ def _parse_time(value) -> datetime | None:
     return None
 
 
-def _parse_checks(value) -> tuple[Check, ...] | Unreadable:
-    """Return the checks a stored ``steps.checks`` value names; ``()`` for NULL."""
+def _parse_json(value, kind: type):
+    """Return the ``kind`` a stored JSON column holds: ``kind()`` for NULL.
+
+    ``UNREADABLE`` if the value is not text, not JSON, or JSON of another kind.
+    """
     if value is None:
-        return ()
+        return kind()
     if not isinstance(value, str):
         return UNREADABLE
     try:
-        items = json.loads(value)
+        parsed = json.loads(value)
     except (ValueError, RecursionError):
         return UNREADABLE
-    if not isinstance(items, list):
+    return parsed if isinstance(parsed, kind) else UNREADABLE
+
+
+def _parse_checks(value) -> tuple[Check, ...] | Unreadable:
+    """Return the checks a stored ``steps.checks`` value names; ``()`` for NULL."""
+    items = _parse_json(value, list)
+    if items is UNREADABLE:
         return UNREADABLE
     checks = []
     for item in items:
@@ -192,10 +230,58 @@ def _parse_checks(value) -> tuple[Check, ...] | Unreadable:
             return UNREADABLE
         name = item.get("name")
         passed = item.get("passed")
+        note = item.get("note")
         if not isinstance(name, str) or not isinstance(passed, bool):
             return UNREADABLE
-        checks.append(Check(name, passed))
+        checks.append(Check(name, passed, note if isinstance(note, str) else ""))
     return tuple(checks)
+
+
+# The columns of ``steps`` that make a ``StepSummary``, in the order it takes them.
+_STEP_COLUMNS = "id, name, persona, attempt, started_at, ended_at, passed, checks"
+
+
+def _step_summary(row) -> StepSummary:
+    """Return the summary of a ``steps`` row that starts with ``_STEP_COLUMNS``."""
+    return StepSummary(
+        row[0],
+        row[1] or "",
+        row[2] or "",
+        row[3],
+        _parse_time(row[4]),
+        _parse_time(row[5]),
+        None if row[6] is None else bool(row[6]),
+        _parse_checks(row[7]),
+    )
+
+
+def _read_one_and_its_rows(one_sql: str, rows_sql: str, params: tuple):
+    """Read one row, then the rows under it, over one read-only connection.
+
+    Both statements take ``params`` and run inside one read transaction, so they
+    describe the same moment. Returns ``(row, rows)``: both ``UNREADABLE`` if the
+    one row could not be read; ``(None, ())`` if there is no such row, the second
+    statement then not being run; ``(row, UNREADABLE)`` if only the rows under it
+    could not be read.
+    """
+    try:
+        conn = _connect()
+    except sqlite3.Error:
+        return UNREADABLE, UNREADABLE
+    try:
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(one_sql, params).fetchone()
+        except sqlite3.Error:
+            return UNREADABLE, UNREADABLE
+        if row is None:
+            return None, ()
+        try:
+            return row, conn.execute(rows_sql, params).fetchall()
+        except sqlite3.Error:
+            return row, UNREADABLE
+    finally:
+        conn.close()
 
 
 def read_page_data() -> PageData:
@@ -281,61 +367,58 @@ def read_run_page_data(run_id: int) -> RunPageData:
     not be read, the run is kept and ``steps`` is ``UNREADABLE``.
     """
     read_at = datetime.now(timezone.utc)
-    try:
-        conn = _connect()
-    except sqlite3.Error:
-        return RunPageData(run_id, UNREADABLE, UNREADABLE, read_at)
-    try:
-        try:
-            conn.execute("BEGIN")
-            row = conn.execute(
-                "SELECT id, state, outcome, request, created_at, ended_at, "
-                "target, branch, reason, attempt_limit FROM runs WHERE id = ?",
-                (run_id,),
-            ).fetchone()
-        except sqlite3.Error:
-            return RunPageData(run_id, UNREADABLE, UNREADABLE, read_at)
-        if row is None:
-            return RunPageData(run_id, None, (), read_at)
+    run, steps = _read_one_and_its_rows(
+        "SELECT id, state, outcome, request, created_at, ended_at, "
+        "target, branch, reason, attempt_limit FROM runs WHERE id = ?",
+        f"SELECT {_STEP_COLUMNS} FROM steps WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    )
+    if run is not None and run is not UNREADABLE:
         run = RunDetail(
             RunSummary(
-                row[0],
-                row[1] or "",
-                row[2] or "",
-                row[3] or "",
-                _parse_time(row[4]),
-                _parse_time(row[5]),
+                run[0],
+                run[1] or "",
+                run[2] or "",
+                run[3] or "",
+                _parse_time(run[4]),
+                _parse_time(run[5]),
             ),
-            row[6] or "",
-            row[7] or "",
-            row[8] or "",
-            row[9],
+            run[6] or "",
+            run[7] or "",
+            run[8] or "",
+            run[9],
         )
-
-        try:
-            step_rows = conn.execute(
-                "SELECT id, name, persona, attempt, started_at, ended_at, passed, "
-                "checks FROM steps WHERE run_id = ? ORDER BY id",
-                (run_id,),
-            ).fetchall()
-        except sqlite3.Error:
-            return RunPageData(run_id, run, UNREADABLE, read_at)
-    finally:
-        conn.close()
-    steps = tuple(
-        StepSummary(
-            step[0],
-            step[1] or "",
-            step[2] or "",
-            step[3],
-            _parse_time(step[4]),
-            _parse_time(step[5]),
-            None if step[6] is None else bool(step[6]),
-            _parse_checks(step[7]),
-        )
-        for step in step_rows
-    )
+    if steps is not UNREADABLE:
+        steps = tuple(_step_summary(step) for step in steps)
     return RunPageData(run_id, run, steps, read_at)
+
+
+def read_step_page_data(run_id: int, step_id: int) -> StepPageData:
+    """Read one step of one run and its events, lowest event id first.
+
+    Both are read over one read-only connection inside one read transaction, so
+    they describe the same moment. If the step could not be read, ``step`` and
+    ``events`` are both ``UNREADABLE``. ``step`` is None only when the ``steps``
+    table was read and has no row with that id for that run; the events are then
+    not read and ``events`` is empty. If only the events could not be read, the
+    step is kept and ``events`` is ``UNREADABLE``.
+    """
+    read_at = datetime.now(timezone.utc)
+    step, events = _read_one_and_its_rows(
+        f"SELECT {_STEP_COLUMNS}, asked, produced FROM steps "
+        "WHERE id = ? AND run_id = ?",
+        "SELECT id, at, kind, summary FROM events "
+        "WHERE step_id = ? AND run_id = ? ORDER BY id",
+        (step_id, run_id),
+    )
+    if step is not None and step is not UNREADABLE:
+        step = StepDetail(_step_summary(step), step[8] or "", _parse_json(step[9], dict))
+    if events is not UNREADABLE:
+        events = tuple(
+            Event(event[0], _parse_time(event[1]), event[2] or "", event[3] or "")
+            for event in events
+        )
+    return StepPageData(run_id, step_id, step, events, read_at)
 
 
 def _document(title: str, body: str) -> str:
@@ -473,33 +556,44 @@ def _render_check(check: Check) -> str:
     return f'<span class="check check-failed">{name} (failed)</span>'
 
 
-def _render_step_row(step: StepSummary, read_at: datetime) -> str:
-    """Return the table line for one step, ending in a newline."""
+def _step_result(step: StepSummary) -> str:
+    """Return ``not finished``, ``passed`` or ``failed``."""
+    if step.passed is None:
+        return "not finished"
+    return "passed" if step.passed else "failed"
+
+
+def _step_duration(step: StepSummary, read_at: datetime) -> str:
+    """Return the step's duration as text, ``so far`` if known and still growing."""
     span = step.duration(read_at)
     duration = _format_duration(span)
     if span is not None and not step.finished:
         duration += " so far"
-    if step.passed is None:
-        result = "not finished"
-    else:
-        result = "passed" if step.passed else "failed"
+    return duration
+
+
+def _render_step_row(run_id: int, step: StepSummary, read_at: datetime) -> str:
+    """Return the table line for one step, ending in a newline."""
     if step.checks is UNREADABLE:
         checks = "unreadable"
     else:
         checks = ", ".join(_render_check(check) for check in step.checks)
     return (
         f'<tr id="step-{step.id}">'
-        f'<td class="step-name">{html.escape(step.name)}</td>'
+        f'<td class="step-name"><a href="/runs/{run_id}/steps/{step.id}">'
+        f"{html.escape(step.name)}</a></td>"
         f'<td class="step-persona">{html.escape(step.persona)}</td>'
         f'<td class="step-attempt">{step.attempt}</td>'
-        f'<td class="step-duration">{duration}</td>'
-        f'<td class="step-result">{result}</td>'
+        f'<td class="step-duration">{_step_duration(step, read_at)}</td>'
+        f'<td class="step-result">{_step_result(step)}</td>'
         f'<td class="step-checks">{checks}</td>'
         "</tr>\n"
     )
 
 
-def _render_steps(steps: tuple[StepSummary, ...] | Unreadable, read_at: datetime) -> str:
+def _render_steps(
+    run_id: int, steps: tuple[StepSummary, ...] | Unreadable, read_at: datetime
+) -> str:
     """Return the page lines for a run's steps, each ending in a newline."""
     if steps is UNREADABLE:
         return (
@@ -515,7 +609,7 @@ def _render_steps(steps: tuple[StepSummary, ...] | Unreadable, read_at: datetime
         "<th>Result</th><th>Checks</th></tr>\n"
         "</thead>\n"
         "<tbody>\n"
-        + "".join(_render_step_row(step, read_at) for step in steps)
+        + "".join(_render_step_row(run_id, step, read_at) for step in steps)
         + "</tbody>\n"
         "</table>\n"
     )
@@ -556,10 +650,126 @@ def render_run_page(data: RunPageData) -> str:
             "could not read the runs table</p>\n"
         )
     else:
-        body = _render_run_facts(run) + _render_steps(steps, read_at)
+        body = _render_run_facts(run) + _render_steps(run_id, steps, read_at)
     return _document(
         f"Run {run_id} - tomfactory viewer", f"<h1>Run {run_id}</h1>\n" + body
     )
+
+
+def _render_produced(produced: dict | Unreadable) -> str:
+    """Return the page lines for what a step produced, each ending in a newline."""
+    if produced is UNREADABLE:
+        return (
+            '<p id="produced-unavailable">Produced unavailable: '
+            "could not read what the step produced</p>\n"
+        )
+    if not produced:
+        return '<p id="no-produced">Nothing produced</p>\n'
+    lines = '<dl id="step-produced">\n'
+    for key, value in produced.items():
+        if not isinstance(value, str):
+            value = json.dumps(value, indent=2, ensure_ascii=False)
+        lines += f"<dt>{html.escape(key)}</dt><dd><pre>{html.escape(value)}</pre></dd>\n"
+    return lines + "</dl>\n"
+
+
+def _render_check_rows(checks: tuple[Check, ...] | Unreadable) -> str:
+    """Return the page lines for a step's checks, each ending in a newline."""
+    if checks is UNREADABLE:
+        return (
+            '<p id="checks-unavailable">Checks unavailable: '
+            "could not read the checks of this step</p>\n"
+        )
+    if not checks:
+        return '<p id="no-checks">No checks recorded</p>\n'
+    return (
+        '<table id="checks">\n'
+        "<thead>\n"
+        "<tr><th>Name</th><th>Result</th><th>Note</th></tr>\n"
+        "</thead>\n"
+        "<tbody>\n"
+        + "".join(
+            f'<tr><td class="check-name">{html.escape(check.name)}</td>'
+            f'<td class="check-result">{"passed" if check.passed else "failed"}</td>'
+            f'<td class="check-note"><pre>{html.escape(check.note)}</pre></td></tr>\n'
+            for check in checks
+        )
+        + "</tbody>\n"
+        "</table>\n"
+    )
+
+
+def _render_events(events: tuple[Event, ...] | Unreadable) -> str:
+    """Return the page lines for a step's events, each ending in a newline."""
+    if events is UNREADABLE:
+        return (
+            '<p id="events-unavailable">Events unavailable: '
+            "could not read the events table</p>\n"
+        )
+    if not events:
+        return '<p id="no-events">No events recorded</p>\n'
+    return (
+        '<table id="events">\n'
+        "<thead>\n"
+        "<tr><th>Time</th><th>Kind</th><th>Summary</th></tr>\n"
+        "</thead>\n"
+        "<tbody>\n"
+        + "".join(
+            f'<tr id="event-{event.id}">'
+            f'<td class="event-time">{_format_time(event.at)}</td>'
+            f'<td class="event-kind">{html.escape(event.kind)}</td>'
+            f'<td class="event-summary">{html.escape(event.summary)}</td></tr>\n'
+            for event in events
+        )
+        + "</tbody>\n"
+        "</table>\n"
+    )
+
+
+def _render_step_facts(step: StepDetail, read_at: datetime) -> str:
+    """Return the page lines describing the step itself, each ending in a newline."""
+    summary = step.summary
+    persona = html.escape(summary.persona) or "none"
+    return (
+        '<dl id="step">\n'
+        f'<dt>Name</dt><dd id="step-name">{html.escape(summary.name)}</dd>\n'
+        f'<dt>Persona</dt><dd id="step-persona">{persona}</dd>\n'
+        f'<dt>Attempt</dt><dd id="step-attempt">{summary.attempt}</dd>\n'
+        f'<dt>Result</dt><dd id="step-result">{_step_result(summary)}</dd>\n'
+        "<dt>Duration</dt>"
+        f'<dd id="step-duration">{_step_duration(summary, read_at)}</dd>\n'
+        "</dl>\n"
+        "<h2>Asked</h2>\n"
+        f'<pre id="step-asked">{html.escape(step.asked)}</pre>\n'
+    )
+
+
+def render_step_page(data: StepPageData) -> str:
+    """Return the full HTML page for one step, its events in the order given."""
+    run_id, step_id, step, events, read_at = data
+    if step is None:
+        return _document(
+            "Step not found - tomfactory viewer",
+            "<h1>Step not found</h1>\n"
+            f'<p id="step-not-found">No step with id {step_id} in run {run_id}</p>\n',
+        )
+    if step is UNREADABLE:
+        body = (
+            '<p id="step-unavailable">Step unavailable: '
+            "could not read the steps table</p>\n"
+        )
+    else:
+        body = (
+            _render_step_facts(step, read_at)
+            + "<h2>Produced</h2>\n"
+            + _render_produced(step.produced)
+            + "<h2>Checks</h2>\n"
+            + _render_check_rows(step.summary.checks)
+            + "<h2>Events</h2>\n"
+            + _render_events(events)
+        )
+    heading = f"Step {step_id} of run {run_id}"
+    return _document(f"{heading} - tomfactory viewer", f"<h1>{heading}</h1>\n" + body)
 
 
 class Response(NamedTuple):
@@ -582,12 +792,18 @@ def _run_route(run_id: str) -> Response:
     return Response(404 if data.run is None else 200, render_run_page(data))
 
 
+def _step_route(run_id: str, step_id: str) -> Response:
+    data = read_step_page_data(int(run_id), int(step_id))
+    return Response(404 if data.step is None else 200, render_step_page(data))
+
+
 # Every path served, tried in order against the whole path. Each function takes the
 # pattern's groups as strings and returns a Response. Any other path is a 404.
 _ROUTES = (
     (re.compile(r"/"), _home_route),
     (re.compile(r"/runs"), _runs_route),
     (re.compile(r"/runs/([1-9][0-9]{0,17})"), _run_route),
+    (re.compile(r"/runs/([1-9][0-9]{0,17})/steps/([1-9][0-9]{0,17})"), _step_route),
 )
 
 
