@@ -15,9 +15,17 @@
   - An empty `runs` table shows "No runs recorded yet". An unreadable database, table or column shows "Runs unavailable: could not read the runs table", with status 200.
   - There is no paging and no link back to the home page. `/runs/` and `/runs/7` return 404.
 - `docs/backlog.md`: eight findings from the architecture review of the `/runs` page, one warning and seven suggestions. None is fixed in this change. The warning is that the standard-library-only import test also rejects imports of this codebase's own modules, so the viewer's layers cannot be split into separate files.
+- `viewer.py`: a page at `/runs/<id>/steps/<step id>` showing one step in full: its name, persona, attempt, result and duration, what it was asked, what it produced (one entry per key), each check with its result and note, and its events in `id` order with time, kind and summary. To see it, run `python viewer.py`, open the page of a run and follow a step's name. See "One step" in [docs/viewer.md](docs/viewer.md).
+- Things to know about the step page:
+  - An unknown step, a step that belongs to another run and an unknown run all give the same 404 page, "No step with id … in run …". It does not say which.
+  - An unreadable database or `steps` table shows "Step unavailable: could not read the steps table", with status 200. Unreadable `produced`, `checks` or `events` each show their own "unavailable" line and the rest of the page is kept.
+  - Every event of the step is on the one page; there is no paging. Event payloads are not shown, and there is no link back to the run.
+- `docs/backlog.md`: seven suggestions from the architecture review of the step page. None is fixed in this change.
 
 ### Changed
 
+- `viewer.py`: on the run page, each step's name in the steps table is now a link to that step's page. Nothing else in the row changed.
+- `viewer.py`: `Check` has a third field, `note` (default `""`). `read_run_page_data` gives the same results as before, now through a shared helper, `_read_one_and_its_rows`, that the step page also uses.
 - `viewer.py`: the home page has one new line, the "All runs" link, between the heading and the count. Nothing else on it changed.
 - `viewer.py`: the page now says "Latest run unavailable: could not read outcome and reason from the runs table" when the latest run could not be read, and stays silent only when the `runs` table has no rows. The count and the latest run are read on one read-only connection in one read transaction, so a page shows one moment. `count_runs()` and `latest_run()` are replaced by `read_page_data()`, and `render_page` takes one `PageData` value. To see the new line, follow "To see the unavailable line" in [docs/viewer.md](docs/viewer.md); to check everything, run `python -m pytest -q -p no:cacheprovider`.
 - Things to know about this change:
