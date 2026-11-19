@@ -3,7 +3,8 @@
 Serves four pages. The home page, at ``/``, says hello and shows how many runs
 the factory has recorded, plus the outcome and reason of the most recent run.
 The runs page, at ``/runs``, lists every run, newest first. The run page, at
-``/runs/<id>``, shows one run and its steps. The step page, at
+``/runs/<id>``, shows one run and its steps; until the run has ended it also says
+which step the run is on now and reloads itself every 5 seconds. The step page, at
 ``/runs/<id>/steps/<step id>``, shows one step in full: what it was asked, what
 it produced, its checks and its events. Uses only the Python standard library.
 
@@ -152,6 +153,19 @@ class RunPageData(NamedTuple):
     run: RunDetail | None | Unreadable  # None only when ``runs`` has no such row
     steps: tuple[StepSummary, ...] | Unreadable  # in the order to show them
     read_at: datetime  # UTC-aware; when the read was made
+
+    @property
+    def live(self) -> bool:
+        """Whether the run was read and has not ended."""
+        return isinstance(self.run, RunDetail) and not self.run.summary.ended
+
+    @property
+    def current_step(self) -> StepSummary | None:
+        """The step a live run is on now: its newest step, if that has not finished."""
+        if not self.live or self.steps is UNREADABLE or not self.steps:
+            return None
+        newest = self.steps[-1]
+        return None if newest.finished else newest
 
 
 class Event(NamedTuple):
@@ -421,13 +435,21 @@ def read_step_page_data(run_id: int, step_id: int) -> StepPageData:
     return StepPageData(run_id, step_id, step, events, read_at)
 
 
-def _document(title: str, body: str) -> str:
-    """Return a full HTML document; ``body`` is lines each ending in a newline."""
+REFRESH_SECONDS = 5  # how often the page of a run that has not ended reloads itself
+
+
+def _document(title: str, body: str, refresh: int | None = None) -> str:
+    """Return a full HTML document; ``body`` is lines each ending in a newline.
+
+    With ``refresh``, the document asks to be reloaded after that many seconds.
+    """
+    reload = "" if refresh is None else f'<meta http-equiv="refresh" content="{refresh}">\n'
     return (
         "<!doctype html>\n"
         '<html lang="en">\n'
         "<head>\n"
         '<meta charset="utf-8">\n'
+        f"{reload}"
         f"<title>{title}</title>\n"
         "</head>\n"
         "<body>\n"
@@ -572,6 +594,24 @@ def _step_duration(step: StepSummary, read_at: datetime) -> str:
     return duration
 
 
+def _step_link(run_id: int, step: StepSummary) -> str:
+    """Return the step's name, linked to its page."""
+    return f'<a href="/runs/{run_id}/steps/{step.id}">{html.escape(step.name)}</a>'
+
+
+def _render_current_step(data: RunPageData) -> str:
+    """Return the page line saying which step a live run is on; nothing otherwise."""
+    if not data.live:
+        return ""
+    step = data.current_step
+    if step is None:
+        return '<p id="no-current-step">No step is running now</p>\n'
+    return (
+        f'<p id="current-step">Current step: {_step_link(data.run_id, step)}, '
+        f"{_step_duration(step, data.read_at)}</p>\n"
+    )
+
+
 def _render_step_row(run_id: int, step: StepSummary, read_at: datetime) -> str:
     """Return the table line for one step, ending in a newline."""
     if step.checks is UNREADABLE:
@@ -580,8 +620,7 @@ def _render_step_row(run_id: int, step: StepSummary, read_at: datetime) -> str:
         checks = ", ".join(_render_check(check) for check in step.checks)
     return (
         f'<tr id="step-{step.id}">'
-        f'<td class="step-name"><a href="/runs/{run_id}/steps/{step.id}">'
-        f"{html.escape(step.name)}</a></td>"
+        f'<td class="step-name">{_step_link(run_id, step)}</td>'
         f'<td class="step-persona">{html.escape(step.persona)}</td>'
         f'<td class="step-attempt">{step.attempt}</td>'
         f'<td class="step-duration">{_step_duration(step, read_at)}</td>'
@@ -650,9 +689,15 @@ def render_run_page(data: RunPageData) -> str:
             "could not read the runs table</p>\n"
         )
     else:
-        body = _render_run_facts(run) + _render_steps(run_id, steps, read_at)
+        body = (
+            _render_run_facts(run)
+            + _render_current_step(data)
+            + _render_steps(run_id, steps, read_at)
+        )
     return _document(
-        f"Run {run_id} - tomfactory viewer", f"<h1>Run {run_id}</h1>\n" + body
+        f"Run {run_id} - tomfactory viewer",
+        f"<h1>Run {run_id}</h1>\n" + body,
+        refresh=REFRESH_SECONDS if data.live else None,
     )
 
 
