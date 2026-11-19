@@ -471,13 +471,33 @@ STEPS_TABLE_OPEN = (
 )
 
 
-def document(title, heading, body):
-    """The whole page expected: ``body`` is lines each ending in a newline."""
+REFRESH_LINE = '<meta http-equiv="refresh" content="5">\n'
+NO_CURRENT_STEP_LINE = '<p id="no-current-step">No step is running now</p>\n'
+# The start of the line naming the current step, step 12 of run 7: formatted with its
+# escaped name, and followed by how long it has been running.
+CURRENT_STEP_START = (
+    '<p id="current-step">Current step: <a href="/runs/7/steps/12">{}</a>, '
+)
+
+
+def current_step_line(name="test", duration="3m 7s so far"):
+    return CURRENT_STEP_START.format(name) + f"{duration}</p>\n"
+
+
+def document(title, heading, body, refresh=None):
+    """The whole page expected: ``body`` is lines each ending in a newline.
+
+    With ``refresh``, the page asks to be reloaded after that many seconds.
+    """
+    refresh_line = (
+        "" if refresh is None else f'<meta http-equiv="refresh" content="{refresh}">\n'
+    )
     return (
         "<!doctype html>\n"
         '<html lang="en">\n'
         "<head>\n"
         '<meta charset="utf-8">\n'
+        f"{refresh_line}"
         f"<title>{title}</title>\n"
         "</head>\n"
         "<body>\n"
@@ -1103,6 +1123,46 @@ def test_step_summary_finished_is_decided_by_passed_not_by_ended_at(viewer):
     assert end_without_result.finished is False
 
 
+# A run (keyword arguments for ``run_detail``, None for not found) and its steps, oldest
+# first, as (id, passed); "unreadable" stands for UNREADABLE. Then whether the run is
+# live, and the id of the step it is on now.
+STALE = {"state": "working", "outcome": "rejected"}
+LIVE_CASES = [
+    pytest.param(NOT_ENDED, [(12, None)], True, 12, id="newest_step_unfinished"),
+    pytest.param(NOT_ENDED, [(11, None), (12, None)], True, 12, id="two_unfinished"),
+    pytest.param(
+        NOT_ENDED, [(11, None), (12, False)], True, None,
+        id="older_unfinished_newest_failed",
+    ),
+    pytest.param(NOT_ENDED, [(11, True), (12, True)], True, None, id="all_finished"),
+    pytest.param(NOT_ENDED, [], True, None, id="no_steps"),
+    pytest.param(NOT_ENDED, "unreadable", True, None, id="unreadable_steps"),
+    pytest.param({}, [(12, None)], False, None, id="ended_run_with_unfinished_step"),
+    pytest.param(STALE, [(12, None)], False, None, id="working_state_with_an_outcome"),
+    pytest.param("unreadable", "unreadable", False, None, id="unreadable_run"),
+    pytest.param(None, [], False, None, id="run_not_found"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("run, steps, live, current", LIVE_CASES)
+def test_run_page_data_is_live_until_the_run_ends_and_its_current_step_is_the_newest_if_unfinished(
+    viewer, run, steps, live, current
+):
+    if isinstance(run, dict):
+        run = run_detail(viewer, **run)
+    elif run == "unreadable":
+        run = viewer.UNREADABLE
+    if steps == "unreadable":
+        steps = viewer.UNREADABLE
+    else:
+        steps = tuple(step_summary(viewer, n, passed=passed) for n, passed in steps)
+    data = viewer.RunPageData(7, run, steps, ENDED_DT)
+    assert data.live is live
+    step = data.current_step
+    assert (None if step is None else step.id) == current
+    assert step is None or step is steps[-1]
+
+
 # The two types with a duration. Each builder takes whether the thing is done (the
 # run has an outcome, the step has a result) and its start and end times.
 DURATION_OWNERS = [
@@ -1668,10 +1728,65 @@ def test_render_run_page_labels_the_status_and_gives_the_reason_by_the_outcome(
 ):
     page = render_run(viewer, run_detail(viewer, state=state, outcome=outcome))
     reason = RUN_REASON if ended else None
+    # Only a run without an outcome refreshes and says which step it is on.
     assert page == document(
         "Run 7 - tomfactory viewer",
         "Run 7",
-        run_facts(label=label, status=status, reason=reason) + NO_STEPS_LINE,
+        run_facts(label=label, status=status, reason=reason)
+        + ("" if ended else NO_CURRENT_STEP_LINE)
+        + NO_STEPS_LINE,
+        refresh=None if ended else 5,
+    )
+
+
+NASTY_NAME = "<u>&\"'"
+LIVE_FACTS = run_facts(label="State", status="working", reason=None)
+SO_FAR = {"duration": "3m 7s so far", "result": "not finished"}
+
+# The steps of a run that has not ended, read 3m 7s after each step started, and the
+# lines that follow the facts of the run.
+LIVE_RUN_DOCUMENTS = [
+    pytest.param(
+        lambda v: [passed_step(v), step_summary(v, **UNFINISHED)],
+        current_step_line()
+        + STEPS_TABLE_OPEN + PASSED_STEP_ROW + step_row(12, **SO_FAR) + TABLE_CLOSE,
+        id="an_unfinished_newest_step_linked_with_its_time_so_far",
+    ),
+    pytest.param(
+        lambda v: [step_summary(v, **UNFINISHED, started_at=None)],
+        current_step_line(duration="unknown")
+        + STEPS_TABLE_OPEN
+        + step_row(12, duration="unknown", result="not finished")
+        + TABLE_CLOSE,
+        id="an_unfinished_step_with_no_start_time_running_for_unknown",
+    ),
+    pytest.param(
+        lambda v: [step_summary(v, name=NASTY_NAME, **UNFINISHED)],
+        current_step_line(html.escape(NASTY_NAME))
+        + STEPS_TABLE_OPEN + step_row(12, name=html.escape(NASTY_NAME), **SO_FAR)
+        + TABLE_CLOSE,
+        id="markup_in_the_step_name_escaped",
+    ),
+    pytest.param(
+        lambda v: [step_summary(v, 11, **UNFINISHED), failed_step(v)],
+        NO_CURRENT_STEP_LINE
+        + STEPS_TABLE_OPEN + step_row(11, **SO_FAR) + FAILED_STEP_ROW + TABLE_CLOSE,
+        id="a_finished_newest_step_so_no_step_is_running",
+    ),
+    pytest.param(
+        lambda v: v.UNREADABLE, NO_CURRENT_STEP_LINE + STEPS_UNAVAILABLE_LINE,
+        id="unreadable_steps_so_no_step_is_named",
+    ),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("steps, lines", LIVE_RUN_DOCUMENTS)
+def test_render_run_page_of_a_run_not_ended_refreshes_every_5_seconds_and_shows(
+    viewer, steps, lines
+):
+    page = render_run(viewer, run_detail(viewer, **NOT_ENDED), steps(viewer))
+    assert page == document(
+        "Run 7 - tomfactory viewer", "Run 7", LIVE_FACTS + lines, refresh=5
     )
 
 
@@ -1955,6 +2070,25 @@ def test_get_run_page_for_an_unknown_id_returns_404_with_the_run_not_found_page(
         "Run not found - tomfactory viewer", "Run not found", run_not_found_line(99)
     )
     assert text == viewer.render_run_page(viewer.RunPageData(99, None, (), ENDED_DT))
+
+
+def test_get_run_page_refreshes_and_names_the_current_step_for_a_running_run_only(
+    home, port
+):
+    # Run 6 has ended and run 7 has not; each has one unfinished step. The time a step
+    # has been running depends on the clock, so it is not compared.
+    unfinished = [{"run_id": 6, "step_id": 11, **UNFINISHED}, {"step_id": 12, **UNFINISHED}]
+    make_run_db(home, runs=[{"run_id": 6}, RUNNING], steps=unfinished)
+    (ended_status, _, ended), (status, _, running) = (
+        fetch(port, f"/runs/{run_id}") for run_id in (6, 7)
+    )
+    running = running.decode("utf-8")
+    assert (ended_status, status) == (200, 200)
+    assert running.count(REFRESH_LINE) == 1
+    assert running.count("http-equiv") == 1
+    assert running.count(CURRENT_STEP_START.format("test")) == 1
+    assert b"http-equiv" not in ended
+    assert b"current-step" not in ended
 
 
 @pytest.mark.parametrize("run_id, step_id", MISSING_STEPS, ids=MISSING_STEP_IDS)
