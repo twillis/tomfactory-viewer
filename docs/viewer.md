@@ -4,7 +4,7 @@ Four web pages about the factory's runs.
 
 - The home page, at `/`, says "Hello from the factory" and shows how many runs the factory has recorded, which is the number of rows in the `runs` table. Below the count it shows the outcome and reason of the most recent run. It links to the runs page ("All runs").
 - The runs page, at `/runs`, lists every run, newest first. See "All runs" below.
-- The run page, at `/runs/<id>`, shows one run and a table of its steps. An unknown id gives a 404 page. It has no section of its own in this document yet.
+- The run page, at `/runs/<id>`, shows one run and a table of its steps. An unknown id gives a 404 page. Until the run has ended, the page also says which step the run is on now and reloads itself every 5 seconds. See "One run while it is running" below.
 - The step page, at `/runs/<id>/steps/<step id>`, shows one step in full. See "One step" below.
 
 ## Start it
@@ -37,7 +37,7 @@ TOMFACTORY_HOME=/path/to/home python viewer.py
 
 The database is opened read-only (`mode=ro`). The viewer never creates the file or its directory and never writes to the database.
 
-Every page reads the database afresh on every request, so reloading a page shows the current values. The pages do not refresh themselves.
+Every page reads the database afresh on every request, so reloading a page shows the current values. Only the page of a run that has not ended reloads itself, every 5 seconds; the other pages do not refresh themselves.
 
 ## Latest run
 
@@ -130,6 +130,41 @@ Things to know:
 ### To see it
 
 With a factory database in place, start the viewer and open <http://127.0.0.1:8000/runs>, or follow "All runs" from the home page. With `TOMFACTORY_HOME` set to an empty directory, the page shows the "Runs unavailable" line.
+
+## One run while it is running
+
+<http://127.0.0.1:8000/runs/7> shows run 7 and a table of its steps. While the run has not ended (its `outcome` is empty, the same rule as on the other pages; `state` is not consulted), the page differs in two ways.
+
+**It reloads itself every 5 seconds.** The page head carries `<meta http-equiv="refresh" content="5">`. There is no JavaScript and no extra HTTP header. Each reload reads the database afresh. The first reload after the run ends comes back without the tag, so the refreshing stops by itself.
+
+**It says which step the run is on now**, in one line between the facts of the run and the steps table:
+
+> Current step: [test](http://127.0.0.1:8000/runs/7/steps/12), 3m 7s so far
+
+The name links to the step's page. The time is the time since the step's `started_at`, in the same form as the Duration column, and is "unknown" when `started_at` cannot be read. When no step is running, the line is instead:
+
+> No step is running now
+
+The page of an ended run has neither the tag nor either line; it is exactly what it was before this change.
+
+Things to know:
+
+- **The current step is the run's newest step row** (highest `id`), if that step has not finished (its `passed` is `NULL`). It is not taken from `runs.current_step`: [run-store.md](run-store.md) does not say how that name relates to the step rows, and a step row has the `started_at` the running time needs. Using the rows also means the line cannot disagree with the steps table below it.
+- **"No step is running now"** appears when the newest step has finished, when the run has no steps yet (between steps, or while `awaiting_approval`), and when the steps could not be read. An older unfinished step under a finished newer one is not named.
+- **Only a run that was read and has not ended refreshes.** The "run not found" page and the "could not read the runs table" page do not, because the page cannot know that run has not ended. So an open page of a running run that hits one unreadable read (for example, a locked database) stops refreshing and stays stale until you reload it by hand. Nothing on the page says so. This is in `docs/backlog.md`.
+- **A run whose driver died** but which has not been marked ended keeps refreshing every 5 seconds, with a step time that keeps growing, until the next `factory` command ends it. The page does not check whether the driver is alive. See guarantee 6 in [run-store.md](run-store.md).
+- **A reload is a whole-page reload**, so the browser may lose your scroll position on a run with many steps.
+- The home, runs and step pages do not refresh, including the page of a step that is still running.
+
+### To see it
+
+Start the viewer while the factory has a run in progress, open <http://127.0.0.1:8000/runs> and go to that run's page (`/runs/<id>`). The "Current step" time grows by about 5 seconds at each reload, and the line changes as the run moves from step to step. When the run ends, the line disappears and the page stops reloading. To check for the tag from a shell:
+
+```
+curl -s http://127.0.0.1:8000/runs/<id> | grep http-equiv
+```
+
+It prints the meta line for a run that has not ended and nothing for one that has.
 
 ## One step
 

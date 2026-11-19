@@ -21,6 +21,14 @@
   - An unreadable database or `steps` table shows "Step unavailable: could not read the steps table", with status 200. Unreadable `produced`, `checks` or `events` each show their own "unavailable" line and the rest of the page is kept.
   - Every event of the step is on the one page; there is no paging. Event payloads are not shown, and there is no link back to the run.
 - `docs/backlog.md`: seven suggestions from the architecture review of the step page. None is fixed in this change.
+- `viewer.py`: the run page (`/runs/<id>`), while the run has not ended, now reloads itself every 5 seconds and says which step the run is on and for how long, for example "Current step: test, 3m 7s so far", or "No step is running now". The page of an ended run is unchanged and does not refresh. To see it, run `python viewer.py` and open the page of a run in progress. See "One run while it is running" in [docs/viewer.md](docs/viewer.md).
+- Things to know about the live run page:
+  - The current step is the run's newest step row, if it has not finished. It is not read from `runs.current_step`.
+  - The refresh is a `<meta http-equiv="refresh">` tag; there is no JavaScript.
+  - The "run not found" and "could not read the runs table" pages do not refresh. An open page of a running run that hits one unreadable read stops refreshing until reloaded by hand.
+  - A run whose driver died but which is not marked ended keeps refreshing, with a step time that keeps growing.
+  - The home, runs and step pages still do not refresh.
+- `docs/backlog.md`: five findings from the architecture review of the live run page, one warning and four suggestions. None is fixed in this change. The warning is that the current step is taken as the last step in display order, so listing steps newest first would silently name the oldest step as current.
 
 ### Changed
 
