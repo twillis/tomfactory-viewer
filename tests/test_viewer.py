@@ -394,11 +394,12 @@ def render_runs(viewer, runs, read_at=ENDED_DT):
     return viewer.render_runs_page(viewer.RunsPageData(runs, read_at))
 
 
-def render_run(viewer, run, steps=(), read_at=ENDED_DT, run_id=7):
-    """Render the run page for a hand-built run, steps and a fixed read time."""
+def render_run(viewer, run, steps=(), read_at=ENDED_DT, run_id=7, events=()):
+    """Render the run page for a hand-built run, steps, events and a fixed read time."""
     if steps is not viewer.UNREADABLE:
         steps = tuple(steps)
-    return viewer.render_run_page(viewer.RunPageData(run_id, run, steps, read_at))
+    data = viewer.RunPageData(run_id, run, steps, events, read_at)
+    return viewer.render_run_page(data)
 
 
 def step_detail(viewer, asked="do the work", produced=None, **summary):
@@ -598,6 +599,11 @@ FULL_BLOCKS = {
 }  # fmt: skip
 # Formatted with an id prefix, what could not be read and from where; step and run id.
 UNAVAILABLE_LINE = '<p id="{}-unavailable">{} unavailable: could not read {}</p>\n'
+EVENTS_UNAVAILABLE_LINE = UNAVAILABLE_LINE.format("events", "Events", "the events table")
+# The heading of the last section of the page of a readable run, and the whole section
+# when the run has no events.
+ACTIVITY_HEADING = "<h2>Latest activity</h2>\n"
+NO_ACTIVITY = ACTIVITY_HEADING + NO_EVENTS_LINE
 STEP_NOT_FOUND_LINE = '<p id="step-not-found">No step with id {} in run {}</p>\n'
 
 
@@ -759,7 +765,7 @@ def test_unreadable_is_not_none_and_not_equal_to_a_count_or_a_run(viewer):
         ("StepPageData", "run_id step_id step events read_at"),
         ("StepSummary", "id name persona attempt started_at ended_at passed checks"),
         ("RunDetail", "summary target branch reason attempt_limit"),
-        ("RunPageData", "run_id run steps read_at"),
+        ("RunPageData", "run_id run steps events read_at"),
     ],
 )
 def test_hand_off_type_has_its_fields_in_order(viewer, name, fields):
@@ -920,11 +926,16 @@ FAILING_STATEMENTS = [
         READERS[1].values[0], "from runs", lambda v: [v.UNREADABLE], id="every_run"
     ),
     pytest.param(
-        READERS[2].values[0], "from runs", lambda v: [v.UNREADABLE] * 2, id="the_run"
+        READERS[2].values[0], "from runs", lambda v: [v.UNREADABLE] * 3, id="the_run"
     ),
     pytest.param(
-        READERS[2].values[0], "steps", lambda v: [run_detail(v), v.UNREADABLE],
+        READERS[2].values[0], "steps", lambda v: [run_detail(v), v.UNREADABLE, ()],
         id="the_steps_keeping_the_run",
+    ),
+    pytest.param(
+        READERS[2].values[0], "events",
+        lambda v: [run_detail(v), (step_summary(v, step_id=1),), v.UNREADABLE],
+        id="the_events_keeping_the_run_and_its_steps",
     ),
     pytest.param(READERS[3].values[0], "steps", lambda v: [v.UNREADABLE] * 2, id="the_step"),
     pytest.param(
@@ -1156,7 +1167,7 @@ def test_run_page_data_is_live_until_the_run_ends_and_its_current_step_is_the_ne
         steps = viewer.UNREADABLE
     else:
         steps = tuple(step_summary(viewer, n, passed=passed) for n, passed in steps)
-    data = viewer.RunPageData(7, run, steps, ENDED_DT)
+    data = viewer.RunPageData(7, run, steps, (), ENDED_DT)
     assert data.live is live
     step = data.current_step
     assert (None if step is None else step.id) == current
@@ -1606,16 +1617,19 @@ def test_read_run_page_data_keeps_the_other_steps_when_one_has_unreadable_checks
 def test_read_run_page_data_runs_no_statement_on_steps_for_an_unknown_id(
     viewer, home, monkeypatch
 ):
-    make_run_db(home, runs=[{"run_id": 7}], steps=[{"run_id": 7}, {"run_id": 99}])
+    steps = [{"run_id": 7}, {"run_id": 99}]
+    make_run_db(home, runs=[{"run_id": 7}], steps=steps, events=[{"run_id": 99}])
     _, proxies = wrap_connections(viewer, monkeypatch)
 
     data = viewer.read_run_page_data(99)
 
     assert data.run is None
     assert data.steps == ()
+    assert data.events == ()
     assert len(proxies) == 1
     assert any("runs" in sql.lower() for sql in proxies[0].statements)
     assert not any("steps" in sql.lower() for sql in proxies[0].statements)
+    assert not any("events" in sql.lower() for sql in proxies[0].statements)
     assert proxies[0].close_calls == 1
 
 
@@ -1649,6 +1663,70 @@ def test_read_run_page_data_keeps_the_run_and_marks_steps_unreadable_without_a_s
     assert data.run == run_detail(viewer)
     assert data.steps is viewer.UNREADABLE
     assert data.steps != ()
+
+
+# The events inserted (run 7 has step 1, run 8 has step 2), and the ids of the events
+# read for run 7, in the order read.
+RUN_EVENTS = [
+    pytest.param([], [], id="none_when_the_run_has_none"),
+    pytest.param(
+        [{"event_id": 5, "at": ENDED}, {"event_id": 9}, {"event_id": 2, "at": "2030-01-01T00:00:00.000Z"}],
+        [9, 5, 2],
+        id="the_highest_id_first_whatever_at_says",
+    ),
+    pytest.param(
+        [{"event_id": 1}, {"event_id": 2, "run_id": 8, "step_id": 2}, {"event_id": 3}],
+        [3, 1],
+        id="not_those_of_another_run",
+    ),
+    pytest.param(
+        [{"event_id": 1}, {"event_id": 2, "step_id": None, "kind": "run_state"}],
+        [2, 1],
+        id="those_with_no_step",
+    ),
+    pytest.param(
+        [{"event_id": n} for n in range(1, 21)], list(range(20, 0, -1)), id="all_of_20"
+    ),
+    pytest.param(
+        [{"event_id": n} for n in range(1, 26)], list(range(25, 5, -1)),
+        id="only_the_20_highest_of_25",
+    ),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("inserted, ids", RUN_EVENTS)
+def test_read_run_page_data_events_are(viewer, home, inserted, ids):
+    both = [{}, {"run_id": 8}]
+    make_run_db(home, runs=both, steps=both, events=inserted)
+    events = viewer.read_run_page_data(7).events
+    assert type(events) is tuple
+    assert [event.id for event in events] == ids
+
+
+def test_read_run_page_data_maps_every_field_of_an_event_of_a_kind_it_does_not_know(
+    viewer, home
+):
+    event = {"event_id": 4, "at": "2026-11-18T21:04:05.250Z", "kind": "brand_new"}
+    make_run_db(home, runs=[{}], steps=[{}], events=[event | {"summary": "<b>café</b>"}])
+    stored_at = CREATED_DT.replace(microsecond=250000)
+    assert viewer.read_run_page_data(7).events == (
+        viewer.Event(4, stored_at, "brand_new", "<b>café</b>"),
+    )
+
+
+@pytest.mark.parametrize("missing", ["events", "steps"])
+def test_read_run_page_data_keeps_the_run_and_the_other_rows_without_the_table(
+    viewer, home, missing
+):
+    path = make_run_db(home, runs=[{}], steps=[{}], events=[{}])
+    execute_sql(path, f"DROP TABLE {missing};")
+    read = {
+        "steps": (step_summary(viewer, step_id=1),),
+        "events": (viewer.Event(1, CREATED_DT, "check", "ran"),),
+    }
+    read[missing] = viewer.UNREADABLE
+    data = viewer.read_run_page_data(7)
+    assert facts(data) == [run_detail(viewer), read["steps"], read["events"]]
 
 
 def test_read_run_page_data_run_and_steps_come_from_the_same_moment(
@@ -1690,20 +1768,34 @@ def test_read_run_page_data_run_and_steps_come_from_the_same_moment(
 RUN_DOCUMENTS = [
     pytest.param(
         lambda v: render_run(v, run_detail(v), [passed_step(v), failed_step(v)]), "Run 7",
-        run_facts() + STEPS_TABLE_OPEN + PASSED_STEP_ROW + FAILED_STEP_ROW + TABLE_CLOSE,
+        run_facts() + STEPS_TABLE_OPEN + PASSED_STEP_ROW + FAILED_STEP_ROW + TABLE_CLOSE
+        + NO_ACTIVITY,
         id="a_run_with_steps",
     ),
     pytest.param(
-        lambda v: render_run(v, run_detail(v), []), "Run 7", run_facts() + NO_STEPS_LINE,
+        lambda v: render_run(v, run_detail(v), []), "Run 7",
+        run_facts() + NO_STEPS_LINE + NO_ACTIVITY,
         id="a_run_with_no_steps",
     ),
     pytest.param(
         lambda v: render_run(v, run_detail(v), v.UNREADABLE), "Run 7",
-        run_facts() + STEPS_UNAVAILABLE_LINE,
+        run_facts() + STEPS_UNAVAILABLE_LINE + NO_ACTIVITY,
         id="unreadable_steps",
     ),
     pytest.param(
-        lambda v: render_run(v, v.UNREADABLE, v.UNREADABLE), "Run 7",
+        lambda v: render_run(v, run_detail(v), [passed_step(v)], events=full_step(v)[1]),
+        "Run 7",
+        run_facts() + STEPS_TABLE_OPEN + PASSED_STEP_ROW + TABLE_CLOSE
+        + ACTIVITY_HEADING + FULL_BLOCKS["events"],
+        id="a_run_with_events_after_its_steps",
+    ),
+    pytest.param(
+        lambda v: render_run(v, run_detail(v), [], events=v.UNREADABLE), "Run 7",
+        run_facts() + NO_STEPS_LINE + ACTIVITY_HEADING + EVENTS_UNAVAILABLE_LINE,
+        id="unreadable_events",
+    ),
+    pytest.param(
+        lambda v: render_run(v, v.UNREADABLE, v.UNREADABLE, events=v.UNREADABLE), "Run 7",
         RUN_UNAVAILABLE_LINE,
         id="an_unreadable_run",
     ),
@@ -1734,7 +1826,8 @@ def test_render_run_page_labels_the_status_and_gives_the_reason_by_the_outcome(
         "Run 7",
         run_facts(label=label, status=status, reason=reason)
         + ("" if ended else NO_CURRENT_STEP_LINE)
-        + NO_STEPS_LINE,
+        + NO_STEPS_LINE
+        + NO_ACTIVITY,
         refresh=None if ended else 5,
     )
 
@@ -1786,7 +1879,15 @@ def test_render_run_page_of_a_run_not_ended_refreshes_every_5_seconds_and_shows(
 ):
     page = render_run(viewer, run_detail(viewer, **NOT_ENDED), steps(viewer))
     assert page == document(
-        "Run 7 - tomfactory viewer", "Run 7", LIVE_FACTS + lines, refresh=5
+        "Run 7 - tomfactory viewer", "Run 7", LIVE_FACTS + lines + NO_ACTIVITY, refresh=5
+    )
+
+
+def test_render_run_page_of_a_run_not_ended_refreshes_and_shows_its_events(viewer):
+    page = render_run(viewer, run_detail(viewer, **NOT_ENDED), events=full_step(viewer)[1])
+    body = LIVE_FACTS + NO_CURRENT_STEP_LINE + NO_STEPS_LINE + ACTIVITY_HEADING
+    assert page == document(
+        "Run 7 - tomfactory viewer", "Run 7", body + FULL_BLOCKS["events"], refresh=5
     )
 
 
@@ -1859,6 +1960,14 @@ def test_render_run_page_keeps_step_rows_in_the_order_given(viewer):
     assert re.findall(r'<tr id="step-(\d+)">', page) == ["30", "4", "12"]
 
 
+def test_render_run_page_shows_every_event_given_in_the_order_given(viewer):
+    # The reader orders and limits the events; the page neither sorts nor cuts them.
+    ids = [3, 30, 1] + list(range(40, 62))
+    events = tuple(viewer.Event(n, CREATED_DT, "check", "ran") for n in ids)
+    page = render_run(viewer, run_detail(viewer), events=events)
+    assert [int(n) for n in re.findall(r'<tr id="event-(\d+)">', page)] == ids
+
+
 def test_render_run_page_escapes_every_stored_text_at_once(viewer):
     nasty = "<u>&\"'"
     run = run_detail(
@@ -1866,10 +1975,11 @@ def test_render_run_page_escapes_every_stored_text_at_once(viewer):
     )
     checks = (viewer.Check(nasty, True), viewer.Check(nasty, False))
     step = step_summary(viewer, name=nasty, persona=nasty, passed=False, checks=checks)
-    page = render_run(viewer, run, [step])
+    events = (viewer.Event(1, CREATED_DT, nasty, nasty),)
+    page = render_run(viewer, run, [step], events=events)
     assert "<u>" not in page
     assert nasty not in page
-    assert page.count(html.escape(nasty)) == 9
+    assert page.count(html.escape(nasty)) == 11
 
 
 # ----------------------------------------------------------------- read_step_page_data
@@ -2069,7 +2179,7 @@ def test_get_run_page_for_an_unknown_id_returns_404_with_the_run_not_found_page(
     assert text == document(
         "Run not found - tomfactory viewer", "Run not found", run_not_found_line(99)
     )
-    assert text == viewer.render_run_page(viewer.RunPageData(99, None, (), ENDED_DT))
+    assert text == viewer.render_run_page(viewer.RunPageData(99, None, (), (), ENDED_DT))
 
 
 def test_get_run_page_refreshes_and_names_the_current_step_for_a_running_run_only(
