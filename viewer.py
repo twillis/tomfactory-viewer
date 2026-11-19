@@ -38,11 +38,26 @@ def db_path() -> Path:
     return Path(home) / "factory.db"
 
 
+# The one rule for whether a run has ended: it has an outcome. Stored, no outcome is
+# NULL or ''; the data layer reads both as "". Change the rule here, in both forms.
+_NOT_ENDED_SQL = "outcome IS NULL OR outcome = ''"  # a WHERE condition on ``runs``
+
+
+def _ended(outcome: str) -> bool:
+    """Whether a run with this outcome, as read, has ended."""
+    return outcome != ""
+
+
 class LatestRun(NamedTuple):
     """What the page knows about the most recent run."""
 
     outcome: str  # "" until the run has ended
     reason: str  # "" until the run has ended
+
+    @property
+    def ended(self) -> bool:
+        """Whether the run has ended: it has an outcome."""
+        return _ended(self.outcome)
 
 
 class Unreadable(Enum):
@@ -67,7 +82,7 @@ class RunSummary(NamedTuple):
     @property
     def ended(self) -> bool:
         """Whether the run has ended: it has an outcome."""
-        return self.outcome != ""
+        return _ended(self.outcome)
 
     @property
     def status(self) -> str:
@@ -381,9 +396,8 @@ def read_page_data() -> PageData:
 
         open_run: OpenRun | None | Unreadable
         try:
-            # The SQL form of ``RunSummary.ended``: a run without an outcome.
             row = conn.execute(
-                "SELECT id, request FROM runs WHERE outcome IS NULL OR outcome = '' "
+                f"SELECT id, request FROM runs WHERE {_NOT_ENDED_SQL} "
                 "ORDER BY id DESC LIMIT 1"
             ).fetchone()
         except sqlite3.Error:
@@ -533,7 +547,7 @@ def _render_latest(latest: LatestRun | None | Unreadable) -> str:
         )
     if latest is None:
         return ""
-    if latest.outcome == "":
+    if not latest.ended:
         return '<p id="latest-run-not-ended">Latest run has not ended yet</p>\n'
     lines = (
         '<p>Latest run outcome: <strong id="latest-run-outcome">'
