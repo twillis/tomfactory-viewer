@@ -3,8 +3,9 @@
 Serves four pages. The home page, at ``/``, says hello and shows how many runs
 the factory has recorded, plus the outcome and reason of the most recent run.
 The runs page, at ``/runs``, lists every run, newest first. The run page, at
-``/runs/<id>``, shows one run and its steps; until the run has ended it also says
-which step the run is on now and reloads itself every 5 seconds. The step page, at
+``/runs/<id>``, shows one run, its steps and its latest activity, the 20 newest
+events of the run; until the run has ended it also says which step the run is on
+now and reloads itself every 5 seconds. The step page, at
 ``/runs/<id>/steps/<step id>``, shows one step in full: what it was asked, what
 it produced, its checks and its events. Uses only the Python standard library.
 
@@ -146,12 +147,25 @@ class RunDetail(NamedTuple):
     attempt_limit: int
 
 
+class Event(NamedTuple):
+    """One thing the factory recorded happening during a run."""
+
+    id: int
+    at: datetime | None  # UTC-aware; None if it could not be parsed
+    kind: str
+    summary: str
+
+
+LATEST_EVENTS = 20  # how many of a run's newest events the run page shows
+
+
 class RunPageData(NamedTuple):
     """Everything the run page shows: the data layer's hand-off to presentation."""
 
     run_id: int  # the id asked for
     run: RunDetail | None | Unreadable  # None only when ``runs`` has no such row
     steps: tuple[StepSummary, ...] | Unreadable  # in the order to show them
+    events: tuple[Event, ...] | Unreadable  # the newest LATEST_EVENTS of the run, newest first
     read_at: datetime  # UTC-aware; when the read was made
 
     @property
@@ -166,15 +180,6 @@ class RunPageData(NamedTuple):
             return None
         newest = self.steps[-1]
         return None if newest.finished else newest
-
-
-class Event(NamedTuple):
-    """One thing the factory recorded happening during a step."""
-
-    id: int
-    at: datetime | None  # UTC-aware; None if it could not be parsed
-    kind: str
-    summary: str
 
 
 class StepDetail(NamedTuple):
@@ -269,31 +274,45 @@ def _step_summary(row) -> StepSummary:
     )
 
 
-def _read_one_and_its_rows(one_sql: str, rows_sql: str, params: tuple):
-    """Read one row, then the rows under it, over one read-only connection.
+# The columns of ``events`` that make an ``Event``, in the order it takes them.
+_EVENT_COLUMNS = "id, at, kind, summary"
 
-    Both statements take ``params`` and run inside one read transaction, so they
-    describe the same moment. Returns ``(row, rows)``: both ``UNREADABLE`` if the
-    one row could not be read; ``(None, ())`` if there is no such row, the second
-    statement then not being run; ``(row, UNREADABLE)`` if only the rows under it
-    could not be read.
+
+def _event(row) -> Event:
+    """Return the event of an ``events`` row that starts with ``_EVENT_COLUMNS``."""
+    return Event(row[0], _parse_time(row[1]), row[2] or "", row[3] or "")
+
+
+def _read_one_and_its_rows(one_sql: str, params: tuple, *rows_sql: str) -> tuple:
+    """Read one row, then each set of rows under it, over one read-only connection.
+
+    Every statement takes ``params`` and runs inside one read transaction, so they
+    describe the same moment. Returns ``(row, rows, ...)``, one ``rows`` for each
+    of ``rows_sql``, in order: all ``UNREADABLE`` if the one row could not be read;
+    ``(None, (), ...)`` if there is no such row, no rows statement then being run.
+    Otherwise each rows statement is tried on its own: one that could not be read
+    is ``UNREADABLE`` for itself only.
     """
+    unreadable = (UNREADABLE,) * (1 + len(rows_sql))
     try:
         conn = _connect()
     except sqlite3.Error:
-        return UNREADABLE, UNREADABLE
+        return unreadable
     try:
         try:
             conn.execute("BEGIN")
             row = conn.execute(one_sql, params).fetchone()
         except sqlite3.Error:
-            return UNREADABLE, UNREADABLE
+            return unreadable
         if row is None:
-            return None, ()
-        try:
-            return row, conn.execute(rows_sql, params).fetchall()
-        except sqlite3.Error:
-            return row, UNREADABLE
+            return (None,) + ((),) * len(rows_sql)
+        result = [row]
+        for sql in rows_sql:
+            try:
+                result.append(conn.execute(sql, params).fetchall())
+            except sqlite3.Error:
+                result.append(UNREADABLE)
+        return tuple(result)
     finally:
         conn.close()
 
@@ -372,20 +391,24 @@ def read_runs_page_data() -> RunsPageData:
 
 
 def read_run_page_data(run_id: int) -> RunPageData:
-    """Read one run and its steps, lowest step id first, over one read-only connection.
+    """Read one run, its steps, lowest id first, and its newest events, highest id first.
 
-    Both are read inside one read transaction, so they describe the same moment.
-    If the run could not be read, ``run`` and ``steps`` are both ``UNREADABLE``.
-    ``run`` is None only when the ``runs`` table was read and has no row with that
-    id; the steps are then not read and ``steps`` is empty. If only the steps could
-    not be read, the run is kept and ``steps`` is ``UNREADABLE``.
+    All are read over one read-only connection inside one read transaction, so
+    they describe the same moment. If the run could not be read, ``run``, ``steps``
+    and ``events`` are all ``UNREADABLE``. ``run`` is None only when the ``runs``
+    table was read and has no row with that id; the steps and events are then not
+    read and both are empty. Steps that could not be read are ``UNREADABLE`` and
+    keep the run and the events; events that could not be read are ``UNREADABLE``
+    and keep the run and the steps. At most ``LATEST_EVENTS`` events are read.
     """
     read_at = datetime.now(timezone.utc)
-    run, steps = _read_one_and_its_rows(
+    run, steps, events = _read_one_and_its_rows(
         "SELECT id, state, outcome, request, created_at, ended_at, "
         "target, branch, reason, attempt_limit FROM runs WHERE id = ?",
-        f"SELECT {_STEP_COLUMNS} FROM steps WHERE run_id = ? ORDER BY id",
         (run_id,),
+        f"SELECT {_STEP_COLUMNS} FROM steps WHERE run_id = ? ORDER BY id",
+        f"SELECT {_EVENT_COLUMNS} FROM events WHERE run_id = ? "
+        f"ORDER BY id DESC LIMIT {LATEST_EVENTS}",
     )
     if run is not None and run is not UNREADABLE:
         run = RunDetail(
@@ -404,7 +427,9 @@ def read_run_page_data(run_id: int) -> RunPageData:
         )
     if steps is not UNREADABLE:
         steps = tuple(_step_summary(step) for step in steps)
-    return RunPageData(run_id, run, steps, read_at)
+    if events is not UNREADABLE:
+        events = tuple(_event(event) for event in events)
+    return RunPageData(run_id, run, steps, events, read_at)
 
 
 def read_step_page_data(run_id: int, step_id: int) -> StepPageData:
@@ -421,17 +446,14 @@ def read_step_page_data(run_id: int, step_id: int) -> StepPageData:
     step, events = _read_one_and_its_rows(
         f"SELECT {_STEP_COLUMNS}, asked, produced FROM steps "
         "WHERE id = ? AND run_id = ?",
-        "SELECT id, at, kind, summary FROM events "
-        "WHERE step_id = ? AND run_id = ? ORDER BY id",
         (step_id, run_id),
+        f"SELECT {_EVENT_COLUMNS} FROM events "
+        "WHERE step_id = ? AND run_id = ? ORDER BY id",
     )
     if step is not None and step is not UNREADABLE:
         step = StepDetail(_step_summary(step), step[8] or "", _parse_json(step[9], dict))
     if events is not UNREADABLE:
-        events = tuple(
-            Event(event[0], _parse_time(event[1]), event[2] or "", event[3] or "")
-            for event in events
-        )
+        events = tuple(_event(event) for event in events)
     return StepPageData(run_id, step_id, step, events, read_at)
 
 
@@ -675,8 +697,8 @@ def _render_run_facts(run: RunDetail) -> str:
 
 
 def render_run_page(data: RunPageData) -> str:
-    """Return the full HTML page for one run, its steps in the order given."""
-    run_id, run, steps, read_at = data
+    """Return the full HTML page for one run, its steps and events in the order given."""
+    run_id, run, steps, events, read_at = data
     if run is None:
         return _document(
             "Run not found - tomfactory viewer",
@@ -693,6 +715,8 @@ def render_run_page(data: RunPageData) -> str:
             _render_run_facts(run)
             + _render_current_step(data)
             + _render_steps(run_id, steps, read_at)
+            + "<h2>Latest activity</h2>\n"
+            + _render_events(events)
         )
     return _document(
         f"Run {run_id} - tomfactory viewer",
@@ -745,7 +769,7 @@ def _render_check_rows(checks: tuple[Check, ...] | Unreadable) -> str:
 
 
 def _render_events(events: tuple[Event, ...] | Unreadable) -> str:
-    """Return the page lines for a step's events, each ending in a newline."""
+    """Return the page lines for events, each ending in a newline."""
     if events is UNREADABLE:
         return (
             '<p id="events-unavailable">Events unavailable: '
