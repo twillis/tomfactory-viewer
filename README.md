@@ -21,6 +21,8 @@ reviewed the architecture, documented and reviewed the result.
   never told to stop. The fix went into the factory (a budget, and a way to tidy without a
   failing test), and two tidy runs brought the tests back to about 1,800 lines with more
   cases covered.
+- **[`docs/runs/`](docs/runs/)** has every run: the request, the plan that was approved, how
+  each step went, what the reviewer said, and the commits it made.
 - `docs/backlog.md` is what the factory's architect persona noted for later.
 
 What it does: a home page, a list of every run, a page for one run with its steps, a page
