@@ -570,10 +570,7 @@ def _render_open_run(open_run: OpenRun | None | Unreadable) -> str:
             '<p id="open-run-unavailable">Open run unavailable: '
             "could not read the runs table</p>\n"
         )
-    if open_run.step is None:
-        step = "No step is running now"
-    else:
-        step = f"Current step: {_step_link(open_run.id, open_run.step)}"
+    step = _current_step_phrase(open_run.id, open_run.step)
     return (
         f'<p id="open-run">Run <a href="/runs/{open_run.id}">{open_run.id}</a> '
         f"has not ended: {html.escape(_first_words(open_run.request))}. {step}</p>\n"
@@ -701,17 +698,22 @@ def _step_link(run_id: int, step: StepSummary) -> str:
     return f'<a href="/runs/{run_id}/steps/{step.id}">{html.escape(step.name)}</a>'
 
 
+def _current_step_phrase(run_id: int, step: StepSummary | None) -> str:
+    """Return the words saying which step a run is on, or that none is running."""
+    if step is None:
+        return "No step is running now"
+    return f"Current step: {_step_link(run_id, step)}"
+
+
 def _render_current_step(data: RunPageData) -> str:
     """Return the page line saying which step a live run is on; nothing otherwise."""
     if not data.live:
         return ""
     step = data.current_step
+    phrase = _current_step_phrase(data.run_id, step)
     if step is None:
-        return '<p id="no-current-step">No step is running now</p>\n'
-    return (
-        f'<p id="current-step">Current step: {_step_link(data.run_id, step)}, '
-        f"{_step_duration(step, data.read_at)}</p>\n"
-    )
+        return f'<p id="no-current-step">{phrase}</p>\n'
+    return f'<p id="current-step">{phrase}, {_step_duration(step, data.read_at)}</p>\n'
 
 
 def _render_step_row(run_id: int, step: StepSummary, read_at: datetime) -> str:
