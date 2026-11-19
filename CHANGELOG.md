@@ -29,6 +29,14 @@
   - A run whose driver died but which is not marked ended keeps refreshing, with a step time that keeps growing.
   - The home, runs and step pages still do not refresh.
 - `docs/backlog.md`: five findings from the architecture review of the live run page, one warning and four suggestions. None is fixed in this change. The warning is that the current step is taken as the last step in display order, so listing steps newest first would silently name the oldest step as current.
+- `viewer.py`: the run page (`/runs/<id>`) now ends with a "Latest activity" section listing the run's 20 most recent events, newest first, each with its time, kind and summary. It is read on every page load, so it updates every 5 seconds while the run has not ended. To see it, run `python viewer.py` and open the page of a run. See "Latest activity" in [docs/viewer.md](docs/viewer.md).
+- Things to know about the latest activity section:
+  - "Most recent" is by highest event `id`, not by `at`.
+  - Events of the whole run are listed, including those that belong to no step. They do not link to their step, and payloads are not shown.
+  - The page does not say when the run has more than 20 events, and there is no paging.
+  - A run with no events shows "No events recorded". Unreadable events show "Events unavailable: could not read the events table" and the run and its steps are kept; unreadable steps no longer prevent the events from being shown.
+  - The "run not found" and "could not read the runs table" pages have no such section.
+- `docs/backlog.md`: six findings from the architecture review of the latest activity section, one warning and five suggestions. None is fixed in this change. The warning is that the run page and the step page show the same events table in opposite orders, and the run page never says it is showing 20 of more.
 
 ### Changed
 
@@ -40,6 +48,8 @@
   - When the database or the `runs` table is missing, the page now shows two lines, "Run count unavailable" and then "Latest run unavailable". Before, it showed only the first.
   - The "Latest run unavailable" line always gives the same cause, "could not read outcome and reason from the runs table", even when the real cause is a missing file or a locked database. The data layer records that a fact could not be read, not why. This is in `docs/backlog.md`.
   - Code that calls `count_runs()`, `latest_run()` or `render_page(count, latest)` must change: the first two are gone, not kept as wrappers.
+
+- `viewer.py`: `RunPageData` has a new field, `events`, between `steps` and `read_at`, so code that builds it by position must change. `_read_one_and_its_rows` now takes `(one_sql, params, *rows_sql)` and returns one set of rows per statement, each readable or not on its own. The step page's output is unchanged.
 
 ### Beyond the request
 

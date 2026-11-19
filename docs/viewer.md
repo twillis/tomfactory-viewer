@@ -4,7 +4,7 @@ Four web pages about the factory's runs.
 
 - The home page, at `/`, says "Hello from the factory" and shows how many runs the factory has recorded, which is the number of rows in the `runs` table. Below the count it shows the outcome and reason of the most recent run. It links to the runs page ("All runs").
 - The runs page, at `/runs`, lists every run, newest first. See "All runs" below.
-- The run page, at `/runs/<id>`, shows one run and a table of its steps. An unknown id gives a 404 page. Until the run has ended, the page also says which step the run is on now and reloads itself every 5 seconds. See "One run while it is running" below.
+- The run page, at `/runs/<id>`, shows one run, a table of its steps and its latest activity, the run's 20 newest events. An unknown id gives a 404 page. Until the run has ended, the page also says which step the run is on now and reloads itself every 5 seconds. See "One run while it is running" and "Latest activity" below.
 - The step page, at `/runs/<id>/steps/<step id>`, shows one step in full. See "One step" below.
 
 ## Start it
@@ -145,7 +145,7 @@ The name links to the step's page. The time is the time since the step's `starte
 
 > No step is running now
 
-The page of an ended run has neither the tag nor either line; it is exactly what it was before this change.
+The page of an ended run has neither the tag nor either line.
 
 Things to know:
 
@@ -165,6 +165,40 @@ curl -s http://127.0.0.1:8000/runs/<id> | grep http-equiv
 ```
 
 It prints the meta line for a run that has not ended and nothing for one that has.
+
+## Latest activity
+
+The page of a run, ended or not, finishes with a "Latest activity" section below the steps table. It lists the run's 20 most recent rows of `events`, newest first, in a table of Time (UTC, as `2026-11-18 21:04:05 UTC`), Kind and Summary. It is the same table the step page shows under Events, in the opposite order.
+
+In place of the table the section shows:
+
+- **The run has no events:**
+
+  > No events recorded
+
+- **The events could not be read** (the `events` table or a column the page reads is missing, or the read failed). The facts of the run and the steps table are still shown:
+
+  > Events unavailable: could not read the events table
+
+The "Run not found" page and the "could not read the runs table" page have no such section.
+
+Things to know:
+
+- **"Most recent" means highest `id`, not latest `at`.** [run-store.md](run-store.md) guarantees that event ids only increase, and the rest of the viewer orders by id. An event whose `at` is out of step with its id is listed by its id.
+- **It updates when the page loads, and has no mechanism of its own.** The events are read with the run and its steps on every request, so the 5-second reload of a run that has not ended keeps the section current. The page of an ended run does not reload itself.
+- **The events are those of the whole run**, including events that belong to no step (`step_id` is `NULL`, such as `run_state`). Every kind is shown as stored, including kinds the viewer does not know.
+- **The page does not say when there are more than 20.** There is no count, no paging and no "more" link. To see every event of a step, open that step's page. This is in `docs/backlog.md`.
+- **An event does not name or link to its step**, and its payload is not shown, as [run-store.md](run-store.md) advises.
+- **The events and the steps fail separately.** If the `steps` table cannot be read, the events are still shown, and the other way round.
+- Times are in whole seconds, and kind and summary text is HTML-escaped. The run, its steps and its events are read on one read-only connection, inside one read transaction, so a page shows one moment.
+
+### To see it
+
+Start the viewer and open the page of any run (`/runs/<id>`); the section is at the bottom. For a run in progress, new events appear at the top of the table within 5 seconds. To count the rows from a shell (at most 20):
+
+```
+curl -s http://127.0.0.1:8000/runs/<id> | grep -c '<tr id="event-'
+```
 
 ## One step
 
