@@ -2,8 +2,8 @@
 
 Four web pages about the factory's runs.
 
-- The home page, at `/`, says "Hello from the factory" and shows how many runs the factory has recorded, which is the number of rows in the `runs` table. Below the count it shows the outcome and reason of the most recent run. It links to the runs page ("All runs").
-- The runs page, at `/runs`, lists every run, newest first. See "All runs" below.
+- The home page, at `/`, says "Hello from the factory" and shows how many runs the factory has recorded, which is the number of rows in the `runs` table. Below the count it shows the outcome and reason of the most recent run. It links to the runs page ("All runs"). If a run has not ended, the home page shows it first, under the heading. See "The run that has not ended" below.
+- The runs page, at `/runs`, lists every run, newest first, and highlights the run that has not ended. See "All runs" below.
 - The run page, at `/runs/<id>`, shows one run, a table of its steps and its latest activity, the run's 20 newest events. An unknown id gives a 404 page. Until the run has ended, the page also says which step the run is on now and reloads itself every 5 seconds. See "One run while it is running" and "Latest activity" below.
 - The step page, at `/runs/<id>/steps/<step id>`, shows one step in full. See "One step" below.
 
@@ -67,7 +67,40 @@ The latest run is the row in `runs` with the highest `id`. The page reads its `o
 
 The run's id is not shown. Outcome and reason text is HTML-escaped.
 
-The count and the latest run are read on one read-only connection, inside one read transaction, so a page shows a count and a latest run from the same moment.
+The count, the latest run and the run that has not ended are read on one read-only connection, inside one read transaction, so the home page shows them all from the same moment.
+
+## The run that has not ended
+
+If a run has not ended, the home page shows one line about it first, directly under the heading and above the "All runs" link:
+
+> Run [7](http://127.0.0.1:8000/runs/7) has not ended: Add a page for one run. Current step: [test](http://127.0.0.1:8000/runs/7/steps/12)
+
+The id links to the run's page and the step name to the step's page. The request is cut to its first 10 words, followed by `…` if there were more, as on `/runs`. When no step is running, the line ends "No step is running now" instead of naming a step.
+
+The line has three forms:
+
+- **A run has not ended:** the line above.
+- **Every run has ended, or there are no runs:** nothing is added.
+- **The runs could not be read** (the database, the `runs` table, or its `outcome` or `request` column is missing, or the database is locked):
+
+  > Open run unavailable: could not read the runs table
+
+It follows the same two rules as the other pages, so they cannot disagree:
+
+- **A run has not ended** when its `outcome` is `NULL` or the empty string; `state` is not consulted. [run-store.md](run-store.md) guarantees at most one such run.
+- **The step it is on now** is the run's newest step row (highest `id`), if that step has not finished, as on the run page. It is not taken from `runs.current_step`.
+
+Things to know:
+
+- **The existing latest-run lines are unchanged.** When the run that has not ended is also the latest, the page shows both this line and "Latest run has not ended yet" further down.
+- **The home page still does not refresh itself.** Reload it to see the run move to its next step. It shows no step time; the run page does.
+- **If the `steps` table cannot be read**, the line says "No step is running now", as the run page does, but with no line saying the steps were unavailable. This is in `docs/backlog.md`.
+- **A run whose driver died** but which has not been marked ended stays on the home page until the next `factory` command ends it.
+- Request and step-name text is HTML-escaped.
+
+### To see it
+
+Start the viewer while the factory has a run in progress and open <http://127.0.0.1:8000/>. The line is the first thing under the heading; follow the id to the run's page.
 
 ## When the count is not available
 
@@ -75,7 +108,7 @@ If `factory.db` is missing, is not a SQLite database, or has no `runs` table, th
 
 > Run count unavailable: no readable runs table in /path/to/factory.db
 
-The "Latest run unavailable" line appears below it, because the latest run cannot be read either.
+The "Latest run unavailable" line appears below it, and the "Open run unavailable" line above it, because neither can be read either.
 
 The count appears on the next reload once the database is readable.
 
@@ -89,7 +122,7 @@ python -c "import sqlite3; c = sqlite3.connect('/tmp/tf-demo/factory.db'); c.exe
 TOMFACTORY_HOME=/tmp/tf-demo python viewer.py
 ```
 
-<http://127.0.0.1:8000/> shows "Runs recorded: 1" and then "Latest run unavailable: …". With `TOMFACTORY_HOME` set to an empty directory, it shows both unavailable lines.
+<http://127.0.0.1:8000/> shows "Open run unavailable: …" under the heading, then "Runs recorded: 1" and then "Latest run unavailable: …". With `TOMFACTORY_HOME` set to an empty directory, it shows all three unavailable lines.
 
 ## All runs
 
@@ -106,6 +139,8 @@ TOMFACTORY_HOME=/tmp/tf-demo python viewer.py
 Durations are in whole seconds, starting at the largest unit that is not zero: `42s`, `3m 7s`, `2h 0m 7s`, `1d 0h 3m 7s`.
 
 Status and request text is HTML-escaped.
+
+The status of the run that has not ended is wrapped in `<mark>`, so browsers highlight it (there is no stylesheet). Ended runs are not marked.
 
 In place of the table the page shows:
 

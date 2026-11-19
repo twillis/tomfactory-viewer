@@ -37,6 +37,14 @@
   - A run with no events shows "No events recorded". Unreadable events show "Events unavailable: could not read the events table" and the run and its steps are kept; unreadable steps no longer prevent the events from being shown.
   - The "run not found" and "could not read the runs table" pages have no such section.
 - `docs/backlog.md`: six findings from the architecture review of the latest activity section, one warning and five suggestions. None is fixed in this change. The warning is that the run page and the step page show the same events table in opposite orders, and the run page never says it is showing 20 of more.
+- `viewer.py`: if a run has not ended, the home page now shows it first, under the heading: "Run 7 has not ended: <first 10 words of the request>. Current step: test", with links to the run and the step, or "No step is running now". On `/runs`, that run's status is wrapped in `<mark>` so it stands out. To see it, run `python viewer.py` while a run is in progress and open <http://127.0.0.1:8000/> and <http://127.0.0.1:8000/runs>. See "The run that has not ended" in [docs/viewer.md](docs/viewer.md).
+- Things to know about the open-run line:
+  - It uses the same rules as the other pages: not ended means an empty `outcome`, and the current step is the newest step row if unfinished.
+  - The "Latest run has not ended yet" line is kept, so a page can say the run has not ended twice.
+  - The home page still does not refresh itself and shows no step time.
+  - When the runs cannot be read the page shows "Open run unavailable: could not read the runs table". A `runs` table without a `request` column now gives this line too, even though the count and latest run still show.
+  - When the `steps` table cannot be read the line says "No step is running now", with nothing saying the steps were unreadable.
+- `docs/backlog.md`: six findings from the architecture review of the open-run line, two warnings and four suggestions. None is fixed in this change. The warnings are the unreadable-steps case above, and that "newest step" is still decided separately by the home page (in SQL) and by the run page (the last of its list), so the two could disagree if the run page's step order changed.
 
 ### Changed
 
@@ -50,6 +58,7 @@
   - Code that calls `count_runs()`, `latest_run()` or `render_page(count, latest)` must change: the first two are gone, not kept as wrappers.
 
 - `viewer.py`: `RunPageData` has a new field, `events`, between `steps` and `read_at`, so code that builds it by position must change. `_read_one_and_its_rows` now takes `(one_sql, params, *rows_sql)` and returns one set of rows per statement, each readable or not on its own. The step page's output is unchanged.
+- `viewer.py`: `PageData` has a third field, `open_run` (an `OpenRun(id, request, step)`, `None` or `UNREADABLE`), with default `None`. Two-argument constructions still work, but the default states "no run is open", so leaving the field out claims that as fact. This is in `docs/backlog.md`.
 
 ### Beyond the request
 
