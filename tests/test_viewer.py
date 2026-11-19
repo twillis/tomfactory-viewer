@@ -90,6 +90,8 @@ RUN_TARGET = "/path/to/target"
 RUN_BRANCH = "factory/7-add-a-page"
 RUN_REASON = "all checks passed"
 TEN_WORDS = "one two three four five six seven eight nine ten"
+LONG_REQUEST = TEN_WORDS + " eleven twelve thirteen"
+NASTY_NAME = "<u>&\"'"
 
 # Keyword arguments that make a run one that has not ended: for ``insert_detail_run``
 # (the stored NULL outcome) and for ``run_summary`` and ``run_detail`` (read as "").
@@ -440,6 +442,20 @@ LATEST_UNAVAILABLE_LINE = (
     '<p id="latest-run-unavailable">Latest run unavailable: '
     "could not read outcome and reason from the runs table</p>\n"
 )
+OPEN_RUN_UNAVAILABLE_LINE = (
+    '<p id="open-run-unavailable">Open run unavailable: '
+    "could not read the runs table</p>\n"
+)
+STEP_12_LINK = 'Current step: <a href="/runs/7/steps/12">test</a>'
+
+
+def open_run_line(request=RUN_REQUEST, step=STEP_12_LINK):
+    """The home page's line for run 7, which has not ended; the texts already escaped."""
+    return (
+        f'<p id="open-run">Run <a href="/runs/7">7</a> has not ended: {request}. '
+        f"{step}</p>\n"
+    )
+
 
 NO_RUNS_LINE = '<p id="no-runs">No runs recorded yet</p>\n'
 RUNS_UNAVAILABLE_LINE = (
@@ -755,7 +771,8 @@ def test_unreadable_is_not_none_and_not_equal_to_a_count_or_a_run(viewer):
 @pytest.mark.parametrize(
     "name, fields",
     [
-        ("PageData", "count latest"),
+        ("PageData", "count latest open_run"),
+        ("OpenRun", "id request step"),
         ("LatestRun", "outcome reason"),
         ("RunSummary", "id state outcome request created_at ended_at"),
         ("RunsPageData", "runs read_at"),
@@ -786,7 +803,69 @@ def test_read_page_data_latest_is_the_not_ended_row_when_older_rows_have_ended(
     viewer, home
 ):
     make_run_db(home, runs=[{"run_id": 1}, {"run_id": 2, "reason": None, **RUNNING}])
-    assert viewer.read_page_data() == viewer.PageData(2, viewer.LatestRun("", ""))
+    assert viewer.read_page_data() == viewer.PageData(
+        2, viewer.LatestRun("", ""), viewer.OpenRun(2, RUN_REQUEST, None)
+    )
+
+
+def loose_open_run(home):
+    """A looser ``runs`` table than the documented one: outcome "" and a NULL request."""
+    path = make_db(home, with_runs_table=False)
+    execute_sql(
+        path,
+        "CREATE TABLE runs (id INTEGER PRIMARY KEY, outcome TEXT, request TEXT);"
+        "INSERT INTO runs (outcome) VALUES ('');",
+    )
+
+
+def no_step(viewer):
+    return viewer.OpenRun(7, RUN_REQUEST, None)
+
+
+# Keyword arguments for ``make_run_db`` (or a function that builds the database), and
+# the open run then read. Run 7 is the one that has not ended.
+STEP_11, STEP_12 = {"step_id": 11}, {"step_id": 12}
+OPEN_RUNS = [
+    pytest.param({}, lambda v: None, id="none_when_there_are_no_runs"),
+    pytest.param(
+        {"runs": [{"run_id": 6}, {}]}, lambda v: None, id="none_when_every_run_has_ended"
+    ),
+    pytest.param({"runs": [RUNNING]}, no_step, id="the_run_with_no_step_when_it_has_none"),
+    pytest.param(
+        {"runs": [RUNNING], "steps": [STEP_11, STEP_12 | UNFINISHED]},
+        lambda v: v.OpenRun(7, RUN_REQUEST, step_summary(v, **UNFINISHED)),
+        id="the_run_with_its_newest_step_when_that_is_unfinished",
+    ),
+    pytest.param(
+        {"runs": [RUNNING], "steps": [STEP_11 | UNFINISHED, STEP_12]}, no_step,
+        id="the_run_with_no_step_when_only_an_older_step_is_unfinished",
+    ),
+    pytest.param(
+        {"runs": [{"run_id": 6}, RUNNING], "steps": [{"run_id": 6, **UNFINISHED}]},
+        no_step, id="the_run_without_the_unfinished_step_of_an_ended_run",
+    ),
+    pytest.param(
+        {"runs": [RUNNING, {"run_id": 8}]}, no_step,
+        id="the_run_without_an_outcome_not_a_newer_ended_run",
+    ),
+    pytest.param(
+        {"runs": [RUNNING], "steps_table": False}, no_step,
+        id="the_run_with_no_step_when_there_is_no_steps_table",
+    ),
+    pytest.param(
+        loose_open_run, lambda v: v.OpenRun(1, "", None),
+        id="the_run_with_an_empty_request_for_an_empty_outcome_and_a_null_request",
+    ),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("db, expected", OPEN_RUNS)
+def test_read_page_data_open_run_is(viewer, home, db, expected):
+    if callable(db):
+        db(home)
+    else:
+        make_run_db(home, **db)
+    assert viewer.read_page_data().open_run == expected(viewer)
 
 
 @pytest.mark.parametrize(
@@ -804,7 +883,7 @@ def test_read_page_data_latest_holds_the_stored_text_with_empty_strings_for_null
 ):
     path = make_db(home, columns=", outcome TEXT, reason TEXT")
     execute_sql(path, "INSERT INTO runs (outcome, reason) VALUES (?, ?)", (outcome, reason))
-    assert viewer.read_page_data() == viewer.PageData(1, viewer.LatestRun(*latest))
+    assert viewer.read_page_data()[:2] == (1, viewer.LatestRun(*latest))
 
 
 def test_read_page_data_returns_zero_and_none_for_an_empty_runs_table(viewer, home):
@@ -816,8 +895,11 @@ def test_read_page_data_returns_zero_and_none_for_an_empty_runs_table(viewer, ho
 def test_read_page_data_keeps_the_count_when_runs_has_no_outcome_or_reason_columns(
     viewer, home
 ):
+    # Without the columns the open run cannot be read either: unreadable, not "none".
     make_db(home, rows=3)
-    assert viewer.read_page_data() == viewer.PageData(3, viewer.UNREADABLE)
+    data = viewer.read_page_data()
+    assert data[:2] == (3, viewer.UNREADABLE)
+    assert data.open_run is viewer.UNREADABLE
 
 
 def test_read_page_data_latest_is_unreadable_for_an_empty_table_without_the_columns(
@@ -827,7 +909,7 @@ def test_read_page_data_latest_is_unreadable_for_an_empty_table_without_the_colu
     # while the count is still a readable zero.
     make_db(home, rows=0)
     data = viewer.read_page_data()
-    assert data == viewer.PageData(0, viewer.UNREADABLE)
+    assert data[:2] == (0, viewer.UNREADABLE)
     assert data.latest is not None
 
 
@@ -848,12 +930,11 @@ def test_read_page_data_count_and_latest_run_come_from_the_same_moment(
             "the second run must be written between the count and the latest-run read"
         )
         assert len(proxies) == 1
-        assert data == viewer.PageData(1, viewer.LatestRun("passed", "first run"))
+        assert data[:2] == (1, viewer.LatestRun("passed", "first run"))
 
         # The second run really was committed: the next read shows it.
-        assert viewer.read_page_data() == viewer.PageData(
-            2, viewer.LatestRun("failed", "second run")
-        )
+        latest = viewer.LatestRun("failed", "second run")
+        assert viewer.read_page_data()[:2] == (2, latest)
 
 
 # ----- every reader: unreadable databases, one read-only connection, no writes, read_at
@@ -1025,6 +1106,44 @@ def test_render_page_is_exactly_the_document_with_these_lines_for(
     )
 
 
+def open_run(viewer, request=RUN_REQUEST, **step):
+    """A hand-built ``OpenRun``: run 7, on unfinished step 12 unless ``step`` says otherwise."""
+    return viewer.OpenRun(7, request, step_summary(viewer, **{**UNFINISHED, **step}))
+
+
+# The open run the home page is given, and the line it shows first for it.
+OPEN_RUN_LINES = [
+    pytest.param(open_run, open_run_line(), id="the_run_its_request_and_its_step"),
+    pytest.param(
+        lambda v: v.OpenRun(7, RUN_REQUEST, None),
+        open_run_line(step="No step is running now"),
+        id="that_no_step_is_running_when_the_run_has_no_current_step",
+    ),
+    pytest.param(
+        lambda v: v.UNREADABLE, OPEN_RUN_UNAVAILABLE_LINE, id="that_it_is_unavailable"
+    ),
+    pytest.param(
+        lambda v: open_run(v, LONG_REQUEST), open_run_line(TEN_WORDS + "…"),
+        id="only_the_first_ten_words_of_a_long_request",
+    ),
+    pytest.param(
+        lambda v: open_run(v, NASTY_NAME, name=NASTY_NAME),
+        open_run_line(
+            html.escape(NASTY_NAME), STEP_12_LINK.replace("test", html.escape(NASTY_NAME))
+        ),
+        id="markup_in_the_request_and_the_step_name_escaped",
+    ),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("given, line", OPEN_RUN_LINES)
+def test_render_page_shows_first_under_the_heading_for_an_open_run(viewer, given, line):
+    page = viewer.render_page(viewer.PageData(3, None, given(viewer)))
+    assert page == document(
+        "tomfactory viewer", "Hello from the factory", line + RUNS_LINK_LINE + COUNT_3
+    )
+
+
 def test_render_page_escapes_html_in_the_database_path(viewer, tmp_path, monkeypatch):
     nasty = tmp_path / "a&b<i>c"
     monkeypatch.setenv("TOMFACTORY_HOME", str(nasty))
@@ -1046,6 +1165,10 @@ RENDERS_WITHOUT_THE_DATABASE = [
         lambda v: v.render_page(v.PageData(3, v.LatestRun("failed", "tests red"))), True,
         COUNT_3 + OUTCOME_LINE.format("failed"),
         id="home",
+    ),
+    pytest.param(
+        lambda v: v.render_page(v.PageData(3, None, open_run(v))), True, open_run_line(),
+        id="home_with_an_open_run",
     ),
     pytest.param(
         lambda v: render_runs(v, [run_summary(v, request="given by the caller")]), True,
@@ -1348,11 +1471,12 @@ def test_render_runs_page_is_exactly_the_planned_document_for(viewer, runs, body
 NASTY_STATE = '<i>"working"</i>'
 
 # Keyword arguments for ``run_summary``, and the arguments of the ``run_row`` shown
-# when the page is read 3m 7s after the run was created.
+# when the page is read 3m 7s after the run was created. The status of a run that has
+# not ended is marked, so it stands out.
 RUN_ROWS = [
     pytest.param({}, (7, "accepted", RUN_REQUEST), id="an_ended_run"),
     pytest.param(
-        NOT_ENDED, (7, "working", RUN_REQUEST, CREATED_TEXT, "3m 7s so far"),
+        NOT_ENDED, (7, "<mark>working</mark>", RUN_REQUEST, CREATED_TEXT, "3m 7s so far"),
         id="a_running_run_says_so_far",
     ),
     pytest.param(
@@ -1365,12 +1489,13 @@ RUN_ROWS = [
     ),
     pytest.param(
         {**NOT_ENDED, "created_at": None},
-        (7, "working", RUN_REQUEST, "unknown", "unknown"),
+        (7, "<mark>working</mark>", RUN_REQUEST, "unknown", "unknown"),
         id="an_unknown_running_duration_does_not_say_so_far",
     ),
     pytest.param(
         {**NOT_ENDED, "state": NASTY_STATE},
-        (7, html.escape(NASTY_STATE), RUN_REQUEST, CREATED_TEXT, "3m 7s so far"),
+        (7, f"<mark>{html.escape(NASTY_STATE)}</mark>", RUN_REQUEST, CREATED_TEXT)
+        + ("3m 7s so far",),
         id="markup_in_the_state_is_escaped",
     ),
 ]  # fmt: skip
@@ -1379,6 +1504,14 @@ RUN_ROWS = [
 @pytest.mark.parametrize("run, row", RUN_ROWS)
 def test_render_runs_page_shows_the_exact_row_of(viewer, run, row):
     assert run_row(*row) in render_runs(viewer, [run_summary(viewer, **run)])
+
+
+def test_render_runs_page_marks_only_the_run_that_has_not_ended(viewer):
+    runs = [run_summary(viewer, 8, **NOT_ENDED), run_summary(viewer, 6)]
+    page = render_runs(viewer, runs)
+    assert page.count("<mark>") == 1
+    assert run_row(8, "<mark>working</mark>", RUN_REQUEST, duration="3m 7s so far") in page
+    assert run_row(6, "accepted", RUN_REQUEST) in page
 
 
 def test_render_runs_page_keeps_rows_in_the_order_given(viewer):
@@ -1832,7 +1965,6 @@ def test_render_run_page_labels_the_status_and_gives_the_reason_by_the_outcome(
     )
 
 
-NASTY_NAME = "<u>&\"'"
 LIVE_FACTS = run_facts(label="State", status="working", reason=None)
 SO_FAR = {"duration": "3m 7s so far", "result": "not finished"}
 
@@ -1889,9 +2021,6 @@ def test_render_run_page_of_a_run_not_ended_refreshes_and_shows_its_events(viewe
     assert page == document(
         "Run 7 - tomfactory viewer", "Run 7", body + FULL_BLOCKS["events"], refresh=5
     )
-
-
-LONG_REQUEST = TEN_WORDS + " eleven twelve thirteen"
 
 
 @pytest.mark.parametrize(
@@ -2199,6 +2328,25 @@ def test_get_run_page_refreshes_and_names_the_current_step_for_a_running_run_onl
     assert running.count(CURRENT_STEP_START.format("test")) == 1
     assert b"http-equiv" not in ended
     assert b"current-step" not in ended
+
+
+def test_get_home_shows_the_open_run_first_and_get_runs_marks_it(viewer, home, port):
+    # Run 6 has ended and run 7 has not; each has one unfinished step.
+    unfinished = [{"run_id": 6, "step_id": 11, **UNFINISHED}, {"step_id": 12, **UNFINISHED}]
+    make_run_db(home, runs=[{"run_id": 6}, RUNNING], steps=unfinished)
+
+    home_page = fetch(port)[2].decode("utf-8")
+    assert home_page.count(open_run_line()) == 1
+    assert home_page.index(open_run_line()) < home_page.index(RUNS_LINK_LINE)
+    assert NOT_ENDED_LINE in home_page
+    assert home_page == viewer.render_page(viewer.read_page_data())
+
+    assert fetch(port, "/runs")[2].decode("utf-8").count("<mark>working</mark>") == 1
+
+    link = re.search(r'<p id="open-run">Run <a href="([^"]+)">7</a>', home_page)
+    status, _, run_page = fetch(port, link.group(1))
+    assert status == 200
+    assert "<h1>Run 7</h1>" in run_page.decode("utf-8")
 
 
 @pytest.mark.parametrize("run_id, step_id", MISSING_STEPS, ids=MISSING_STEP_IDS)
