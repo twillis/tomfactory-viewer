@@ -1,8 +1,10 @@
 """Hello-world observability pages for the factory.
 
 Serves four pages. The home page, at ``/``, says hello and shows how many runs
-the factory has recorded, plus the outcome and reason of the most recent run.
-The runs page, at ``/runs``, lists every run, newest first. The run page, at
+the factory has recorded, plus the outcome and reason of the most recent run;
+if a run has not ended it shows that run first: its id, the first words of its
+request and the step it is on now. The runs page, at ``/runs``, lists every
+run, newest first, and marks the one that has not ended. The run page, at
 ``/runs/<id>``, shows one run, its steps and its latest activity, the 20 newest
 events of the run; until the run has ended it also says which step the run is on
 now and reloads itself every 5 seconds. The step page, at
@@ -50,13 +52,6 @@ class Unreadable(Enum):
 
 
 UNREADABLE = Unreadable.UNREADABLE
-
-
-class PageData(NamedTuple):
-    """Everything the page shows: what the data layer hands to the presentation layer."""
-
-    count: int | Unreadable  # number of rows in ``runs``
-    latest: LatestRun | None | Unreadable  # None only when ``runs`` has no rows
 
 
 class RunSummary(NamedTuple):
@@ -137,6 +132,27 @@ class StepSummary(NamedTuple):
         return max(span, timedelta(0))
 
 
+def _step_now(newest: StepSummary | None) -> StepSummary | None:
+    """The step a run that has not ended is on now: its newest step, if unfinished."""
+    return None if newest is None or newest.finished else newest
+
+
+class OpenRun(NamedTuple):
+    """What the home page knows about the run that has not ended."""
+
+    id: int
+    request: str  # the full text
+    step: StepSummary | None  # the step it is on now; None if none, or steps unreadable
+
+
+class PageData(NamedTuple):
+    """Everything the page shows: what the data layer hands to the presentation layer."""
+
+    count: int | Unreadable  # number of rows in ``runs``
+    latest: LatestRun | None | Unreadable  # None only when ``runs`` has no rows
+    open_run: OpenRun | None | Unreadable = None  # None only when no run is without an outcome
+
+
 class RunDetail(NamedTuple):
     """What the run page knows about its run: the summary plus the rest."""
 
@@ -178,8 +194,7 @@ class RunPageData(NamedTuple):
         """The step a live run is on now: its newest step, if that has not finished."""
         if not self.live or self.steps is UNREADABLE or not self.steps:
             return None
-        newest = self.steps[-1]
-        return None if newest.finished else newest
+        return _step_now(self.steps[-1])
 
 
 class StepDetail(NamedTuple):
@@ -317,23 +332,37 @@ def _read_one_and_its_rows(one_sql: str, params: tuple, *rows_sql: str) -> tuple
         conn.close()
 
 
+def _read_step_now(conn: sqlite3.Connection, run_id: int) -> StepSummary | None:
+    """Read the step a run is on now; None if there is none or the steps are unreadable."""
+    try:
+        row = conn.execute(
+            f"SELECT {_STEP_COLUMNS} FROM steps WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return _step_now(None if row is None else _step_summary(row))
+
+
 def read_page_data() -> PageData:
     """Read everything the page shows, over one read-only connection.
 
-    The database is opened read-only, so it is never created or changed. Both facts
-    are read inside one read transaction, so they describe the same moment. A fact
-    that could not be read is ``UNREADABLE``; ``latest`` is None only when the
-    ``runs`` table was read and has no rows.
+    The database is opened read-only, so it is never created or changed. All three
+    facts are read inside one read transaction, so they describe the same moment. A
+    fact that could not be read is ``UNREADABLE``; ``latest`` is None only when the
+    ``runs`` table was read and has no rows, ``open_run`` only when it was read and
+    every run has an outcome. The open run's step is None if its steps could not
+    be read, as on the run page.
     """
     try:
         conn = _connect()
     except sqlite3.Error:
-        return PageData(UNREADABLE, UNREADABLE)
+        return PageData(UNREADABLE, UNREADABLE, UNREADABLE)
     try:
         try:
             conn.execute("BEGIN")
         except sqlite3.Error:
-            return PageData(UNREADABLE, UNREADABLE)
+            return PageData(UNREADABLE, UNREADABLE, UNREADABLE)
 
         count: int | Unreadable
         try:
@@ -350,7 +379,21 @@ def read_page_data() -> PageData:
         except sqlite3.Error:
             latest = UNREADABLE
 
-        return PageData(count, latest)
+        open_run: OpenRun | None | Unreadable
+        try:
+            # The SQL form of ``RunSummary.ended``: a run without an outcome.
+            row = conn.execute(
+                "SELECT id, request FROM runs WHERE outcome IS NULL OR outcome = '' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            open_run = UNREADABLE
+        else:
+            open_run = None if row is None else OpenRun(
+                row[0], row[1] or "", _read_step_now(conn, row[0])
+            )
+
+        return PageData(count, latest, open_run)
     finally:
         conn.close()
 
@@ -504,9 +547,28 @@ def _render_latest(latest: LatestRun | None | Unreadable) -> str:
     return lines
 
 
+def _render_open_run(open_run: OpenRun | None | Unreadable) -> str:
+    """Return the page line for the run that has not ended; nothing if there is none."""
+    if open_run is None:
+        return ""
+    if open_run is UNREADABLE:
+        return (
+            '<p id="open-run-unavailable">Open run unavailable: '
+            "could not read the runs table</p>\n"
+        )
+    if open_run.step is None:
+        step = "No step is running now"
+    else:
+        step = f"Current step: {_step_link(open_run.id, open_run.step)}"
+    return (
+        f'<p id="open-run">Run <a href="/runs/{open_run.id}">{open_run.id}</a> '
+        f"has not ended: {html.escape(_first_words(open_run.request))}. {step}</p>\n"
+    )
+
+
 def render_page(data: PageData) -> str:
     """Return the full HTML page for the given page data."""
-    count, latest = data
+    count, latest, open_run = data
     if count is UNREADABLE:
         status = (
             '<p id="run-count-unavailable">Run count unavailable: '
@@ -517,6 +579,7 @@ def render_page(data: PageData) -> str:
     return _document(
         "tomfactory viewer",
         "<h1>Hello from the factory</h1>\n"
+        f"{_render_open_run(open_run)}"
         '<p><a id="runs-link" href="/runs">All runs</a></p>\n'
         f"{status}\n"
         f"{_render_latest(latest)}",
@@ -556,10 +619,13 @@ def _render_run_row(run: RunSummary, read_at: datetime) -> str:
     duration = _format_duration(span)
     if span is not None and not run.ended:
         duration += " so far"
+    status = html.escape(run.status)
+    if not run.ended:
+        status = f"<mark>{status}</mark>"  # the run that has not ended stands out
     return (
         f'<tr id="run-{run.id}">'
         f'<td class="run-id"><a href="/runs/{run.id}">{run.id}</a></td>'
-        f'<td class="run-status">{html.escape(run.status)}</td>'
+        f'<td class="run-status">{status}</td>'
         f'<td class="run-request">{html.escape(_first_words(run.request))}</td>'
         f'<td class="run-created">{_format_time(run.created_at)}</td>'
         f'<td class="run-duration">{duration}</td>'
