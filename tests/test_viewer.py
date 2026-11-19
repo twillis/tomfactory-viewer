@@ -66,7 +66,20 @@ CREATE TABLE steps (
 CREATE INDEX steps_by_run  ON steps  (run_id, id);
 """
 
-CREATED = "2026-11-18T21:04:05Z"
+# The ``events`` table, exactly as docs/run-store.md gives it.
+EVENTS_DDL = """
+CREATE TABLE events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id    INTEGER NOT NULL REFERENCES runs(id),
+    step_id   INTEGER REFERENCES steps(id),
+    at        TEXT    NOT NULL,
+    kind      TEXT    NOT NULL,
+    summary   TEXT    NOT NULL,
+    payload   JSON TEXT NOT NULL
+);
+"""
+
+CREATED ="2026-11-18T21:04:05Z"
 ENDED = "2026-11-18T21:07:12Z"  # 3m 7s after CREATED
 CREATED_DT = datetime(2026, 11, 18, 21, 4, 5, tzinfo=timezone.utc)
 ENDED_DT = CREATED_DT + timedelta(seconds=187)
@@ -143,31 +156,47 @@ def insert_detail_run(
 def insert_step(
     path, run_id=7, step_id=None, name="test", kind="agent", persona="tester",
     attempt=1, checks=None, passed=1, started_at=CREATED, ended_at=ENDED,
+    asked="do the work", produced=None,
 ):  # fmt: skip
     """Insert one row into a ``steps`` table; finished and passed by default."""
     execute_sql(
         path,
-        "INSERT INTO steps (id, run_id, name, kind, persona, attempt, asked, checks, "
-        "passed, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (step_id, run_id, name, kind, persona, attempt, "do the work", checks)
+        "INSERT INTO steps (id, run_id, name, kind, persona, attempt, asked, produced, "
+        "checks, passed, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (step_id, run_id, name, kind, persona, attempt, asked, produced, checks)
         + (passed, started_at, ended_at),
     )
 
 
-def make_run_db(home, runs=(), steps=(), steps_table=True):
+def insert_event(
+    path, run_id=7, step_id=1, event_id=None, at=CREATED, kind="check", summary="ran",
+):  # fmt: skip
+    """Insert one row into the ``events`` table; of step 1 of run 7 by default."""
+    execute_sql(
+        path,
+        "INSERT INTO events (id, run_id, step_id, at, kind, summary, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, '{}')",
+        (event_id, run_id, step_id, at, kind, summary),
+    )
+
+
+def make_run_db(home, runs=(), steps=(), steps_table=True, events=()):
     """Create ``home/factory.db`` with the documented ``runs`` and ``steps`` tables.
 
     ``runs`` and ``steps`` are sequences of keyword-argument mappings for
     ``insert_detail_run`` and ``insert_step``, inserted in order. With
-    ``steps_table=False`` the ``steps`` table is left out.
+    ``steps_table=False`` the ``steps`` table is left out. The ``events`` table is
+    always made; ``events`` are mappings for ``insert_event``.
     """
     home.mkdir(parents=True, exist_ok=True)
     path = home / "factory.db"
-    execute_sql(path, RUNS_DDL + (STEPS_DDL if steps_table else ""))
+    execute_sql(path, RUNS_DDL + (STEPS_DDL if steps_table else "") + EVENTS_DDL)
     for run in runs:
         insert_detail_run(path, **run)
     for step in steps:
         insert_step(path, **step)
+    for event in events:
+        insert_event(path, **event)
     return path
 
 
@@ -313,8 +342,9 @@ def write_mid_read(
 
 
 def facts(data):
-    """What a hand-off says was read: every field but ``run_id`` and ``read_at``."""
-    return [v for k, v in data._asdict().items() if k not in ("run_id", "read_at")]
+    """What a hand-off says was read: every field but the ids asked for and ``read_at``."""
+    asked_or_clock = ("run_id", "step_id", "read_at")
+    return [v for k, v in data._asdict().items() if k not in asked_or_clock]
 
 
 def run_summary(
@@ -369,6 +399,27 @@ def render_run(viewer, run, steps=(), read_at=ENDED_DT, run_id=7):
     if steps is not viewer.UNREADABLE:
         steps = tuple(steps)
     return viewer.render_run_page(viewer.RunPageData(run_id, run, steps, read_at))
+
+
+def step_detail(viewer, asked="do the work", produced=None, **summary):
+    """A hand-built ``StepDetail`` around ``step_summary``; nothing produced by default."""
+    produced = {} if produced is None else produced
+    return viewer.StepDetail(step_summary(viewer, **summary), asked, produced)
+
+
+def full_step(viewer):
+    """Step 12, failed on attempt 2, and its two events: rendered as ``FULL_BLOCKS``."""
+    checks = (viewer.Check("guard", True), viewer.Check("tests", False, "1 failed"))
+    produced = {"summary": "added greet", "files": ["café.py"]}
+    began = viewer.Event(4, CREATED_DT, "step_start", "began")
+    step = step_detail(viewer, "write it", produced, attempt=2, passed=False, checks=checks)
+    return step, (began, viewer.Event(3, None, "check", "red"))
+
+
+def render_step(viewer, step, events=(), read_at=ENDED_DT, run_id=7, step_id=12):
+    """Render the step page for a hand-built step, events and a fixed read time."""
+    data = viewer.StepPageData(run_id, step_id, step, events, read_at)
+    return viewer.render_step_page(data)
 
 
 # ---------------------------------------------------------------- helpers: expected HTML
@@ -476,12 +527,12 @@ def run_facts(
 
 def step_row(
     step_id, name="test", persona="tester", attempt=1, duration="3m 7s",
-    result="passed", checks="",
+    result="passed", checks="", run_id=7,
 ):  # fmt: skip
     """The table line the run page shows for one step; the texts are already escaped."""
     return (
         f'<tr id="step-{step_id}">'
-        f'<td class="step-name">{name}</td>'
+        f'<td class="step-name"><a href="/runs/{run_id}/steps/{step_id}">{name}</a></td>'
         f'<td class="step-persona">{persona}</td>'
         f'<td class="step-attempt">{attempt}</td>'
         f'<td class="step-duration">{duration}</td>'
@@ -500,6 +551,53 @@ FAILED_STEP_ROW = step_row(
     '<span class="check">guard</span>, '
     '<span class="check check-failed">tests (failed)</span>',
 )  # fmt: skip
+
+NO_PRODUCED_LINE = '<p id="no-produced">Nothing produced</p>\n'
+NO_CHECKS_LINE = '<p id="no-checks">No checks recorded</p>\n'
+NO_EVENTS_LINE = '<p id="no-events">No events recorded</p>\n'
+# The three blocks of the step page for ``full_step``: produced keys in stored order
+# with a value that is not text as indented JSON, checks and events in the order given.
+FULL_BLOCKS = {
+    "produced": '<dl id="step-produced">\n'
+    "<dt>summary</dt><dd><pre>added greet</pre></dd>\n"
+    "<dt>files</dt><dd><pre>[\n  &quot;café.py&quot;\n]</pre></dd>\n"
+    "</dl>\n",
+    "checks": '<table id="checks">\n<thead>\n'
+    "<tr><th>Name</th><th>Result</th><th>Note</th></tr>\n</thead>\n<tbody>\n"
+    '<tr><td class="check-name">guard</td><td class="check-result">passed</td>'
+    '<td class="check-note"><pre></pre></td></tr>\n'
+    '<tr><td class="check-name">tests</td><td class="check-result">failed</td>'
+    '<td class="check-note"><pre>1 failed</pre></td></tr>\n' + TABLE_CLOSE,
+    "events": '<table id="events">\n<thead>\n'
+    "<tr><th>Time</th><th>Kind</th><th>Summary</th></tr>\n</thead>\n<tbody>\n"
+    f'<tr id="event-4"><td class="event-time">{CREATED_TEXT}</td>'
+    '<td class="event-kind">step_start</td><td class="event-summary">began</td></tr>\n'
+    '<tr id="event-3"><td class="event-time">unknown</td>'
+    '<td class="event-kind">check</td><td class="event-summary">red</td></tr>\n'
+    + TABLE_CLOSE,
+}  # fmt: skip
+# Formatted with an id prefix, what could not be read and from where; step and run id.
+UNAVAILABLE_LINE = '<p id="{}-unavailable">{} unavailable: could not read {}</p>\n'
+STEP_NOT_FOUND_LINE = '<p id="step-not-found">No step with id {} in run {}</p>\n'
+
+
+def step_body(
+    name="test", persona="tester", attempt=1, result="passed", duration="3m 7s",
+    asked="do the work", produced=NO_PRODUCED_LINE, checks=NO_CHECKS_LINE,
+    events=NO_EVENTS_LINE,
+):  # fmt: skip
+    """The lines the step page shows for a readable step; the texts are already escaped."""
+    return (
+        '<dl id="step">\n'
+        f'<dt>Name</dt><dd id="step-name">{name}</dd>\n'
+        f'<dt>Persona</dt><dd id="step-persona">{persona}</dd>\n'
+        f'<dt>Attempt</dt><dd id="step-attempt">{attempt}</dd>\n'
+        f'<dt>Result</dt><dd id="step-result">{result}</dd>\n'
+        f'<dt>Duration</dt><dd id="step-duration">{duration}</dd>\n'
+        f'</dl>\n<h2>Asked</h2>\n<pre id="step-asked">{asked}</pre>\n'
+        f"<h2>Produced</h2>\n{produced}<h2>Checks</h2>\n{checks}<h2>Events</h2>\n{events}"
+    )
+
 
 # --------------------------------------------------- helpers: fixtures and the server
 
@@ -584,6 +682,7 @@ READERS = [
     pytest.param(lambda viewer: viewer.read_page_data(), id="read_page_data"),
     pytest.param(lambda viewer: viewer.read_runs_page_data(), id="read_runs_page_data"),
     pytest.param(lambda viewer: viewer.read_run_page_data(7), id="read_run_page_data"),
+    pytest.param(lambda v: v.read_step_page_data(7, 1), id="read_step_page_data"),
 ]
 
 # ---------------------------------------- db_path, UNREADABLE and the hand-off types
@@ -634,7 +733,10 @@ def test_unreadable_is_not_none_and_not_equal_to_a_count_or_a_run(viewer):
         ("LatestRun", "outcome reason"),
         ("RunSummary", "id state outcome request created_at ended_at"),
         ("RunsPageData", "runs read_at"),
-        ("Check", "name passed"),
+        ("Check", "name passed note"),
+        ("Event", "id at kind summary"),
+        ("StepDetail", "summary asked produced"),
+        ("StepPageData", "run_id step_id step events read_at"),
         ("StepSummary", "id name persona attempt started_at ended_at passed checks"),
         ("RunDetail", "summary target branch reason attempt_limit"),
         ("RunPageData", "run_id run steps read_at"),
@@ -804,6 +906,11 @@ FAILING_STATEMENTS = [
         READERS[2].values[0], "steps", lambda v: [run_detail(v), v.UNREADABLE],
         id="the_steps_keeping_the_run",
     ),
+    pytest.param(READERS[3].values[0], "steps", lambda v: [v.UNREADABLE] * 2, id="the_step"),
+    pytest.param(
+        READERS[3].values[0], "events", lambda v: [step_detail(v, step_id=1), v.UNREADABLE],
+        id="the_events_keeping_the_step",
+    ),
 ]  # fmt: skip
 
 
@@ -941,6 +1048,10 @@ RENDERS_WITHOUT_THE_DATABASE = [
     ),
     pytest.param(
         lambda v: render_run(v, None), True, run_not_found_line(7), id="run_not_found"
+    ),
+    pytest.param(
+        lambda v: render_step(v, step_detail(v, asked="given by the caller")), True,
+        '<pre id="step-asked">given by the caller</pre>\n', id="step",
     ),
 ]  # fmt: skip
 
@@ -1646,6 +1757,146 @@ def test_render_run_page_escapes_every_stored_text_at_once(viewer):
     assert page.count(html.escape(nasty)) == 9
 
 
+# ----------------------------------------------------------------- read_step_page_data
+
+
+def test_read_step_page_data_maps_every_field_of_a_step_and_its_events_in_id_order(
+    viewer, home
+):
+    failed = {"name": "tests", "passed": False, "note": "1 failed", "timed_out": False}
+    produced = {"summary": "done", "files": ["a.py"]}
+    step = {"step_id": 12, "attempt": 2, "passed": 0, "checks": json.dumps([failed])}
+    step |= {"asked": "write the tests", "produced": json.dumps(produced)}
+    events = [
+        {"event_id": 30, "step_id": 12, "kind": "step_end", "summary": "finished"},
+        {"event_id": 4, "step_id": 12, "at": ENDED, "kind": "step_start"},
+        {"event_id": 5, "step_id": 13, "summary": "of another step"},
+        {"event_id": 6, "step_id": None, "summary": "of the run alone"},
+    ]
+    make_run_db(home, runs=[{}], steps=[step, {"step_id": 13}], events=events)
+    data = viewer.read_step_page_data(7, 12)
+    checks = (viewer.Check("tests", False, "1 failed"),)
+    detail = step_detail(
+        viewer, "write the tests", produced, attempt=2, passed=False, checks=checks
+    )
+    began = viewer.Event(4, ENDED_DT, "step_start", "ran")
+    ended = viewer.Event(30, CREATED_DT, "step_end", "finished")
+    assert data == viewer.StepPageData(7, 12, detail, (began, ended), data.read_at)
+
+
+# Keyword arguments for ``make_run_db``: step 1 is of run 7 and step 2 of run 8, each
+# with an event. Then the steps that are not there, as (run id, step id).
+BOTH = [{}, {"run_id": 8}]
+TWO_RUNS = {"runs": BOTH, "steps": BOTH, "events": [{}, {"run_id": 8, "step_id": 2}]}
+MISSING_STEPS = [(7, 99), (7, 2), (99, 1)]
+MISSING_STEP_IDS = ["an_unknown_step", "a_step_of_another_run", "an_unknown_run"]
+
+
+@pytest.mark.parametrize("run_id, step_id", MISSING_STEPS, ids=MISSING_STEP_IDS)
+def test_read_step_page_data_gives_no_step_and_runs_no_statement_on_events_for(
+    viewer, home, monkeypatch, run_id, step_id
+):
+    make_run_db(home, **TWO_RUNS)
+    _, proxies = wrap_connections(viewer, monkeypatch)
+
+    data = viewer.read_step_page_data(run_id, step_id)
+
+    assert data[:4] == (run_id, step_id, None, ())
+    assert any("steps" in sql.lower() for sql in proxies[0].statements)
+    assert not any("events" in sql.lower() for sql in proxies[0].statements)
+
+
+# A stored ``steps.produced``, and what is read from it: ``None`` stands for UNREADABLE.
+PRODUCED = [
+    pytest.param(None, {}, id="null_gives_an_empty_object"),
+    pytest.param('{"b": 1, "a": "x"}', {"b": 1, "a": "x"}, id="an_object_in_key_order"),
+    pytest.param("not json", None, id="not_json"),
+    pytest.param('["a"]', None, id="a_list"),
+    pytest.param("42", None, id="a_number"),
+    pytest.param(b"\x00\x01binary", None, id="a_blob"),
+]
+
+
+@pytest.mark.parametrize("stored, expected", PRODUCED)
+def test_read_step_page_data_produced_is_read_from(viewer, home, stored, expected):
+    make_run_db(home, runs=[{}], steps=[{"produced": stored}])
+    step = viewer.read_step_page_data(7, 1).step
+    expected = viewer.UNREADABLE if expected is None else expected
+    assert step.produced == expected
+    assert expected is viewer.UNREADABLE or list(step.produced) == list(expected)
+    assert step.summary == step_summary(viewer, step_id=1)
+
+
+@pytest.mark.parametrize(
+    "check, note",
+    [({"note": "1 failed\n<b>"}, "1 failed\n<b>"), ({}, ""), ({"note": None}, "")]
+    + [({"note": 5}, "")],
+    ids=["text_is_kept", "missing_is_empty", "null_is_empty", "a_number_is_empty"],
+)
+def test_read_step_page_data_note_of_a_check_when(viewer, home, check, note):
+    stored = json.dumps([{"name": "guard", "passed": False, **check}])
+    make_run_db(home, runs=[{}], steps=[{"checks": stored}])
+    checks = viewer.read_step_page_data(7, 1).step.summary.checks
+    assert checks == (viewer.Check("guard", False, note),)
+
+
+# -------------------------------------------------------------------- render_step_page
+
+# How the page is rendered, its heading (which also starts its title), and its body.
+STEP_DOCUMENTS = [
+    pytest.param(
+        lambda v: render_step(v, *full_step(v)), "Step 12 of run 7",
+        step_body(attempt=2, result="failed", asked="write it", **FULL_BLOCKS),
+        id="a_full_step",
+    ),
+    pytest.param(
+        lambda v: render_step(v, step_detail(v, persona="", **UNFINISHED)),
+        "Step 12 of run 7",
+        step_body(persona="none", result="not finished", duration="3m 7s so far"),
+        id="an_unfinished_step_with_no_persona_and_every_block_empty",
+    ),
+    pytest.param(
+        lambda v: render_step(
+            v, step_detail(v, produced=v.UNREADABLE, checks=v.UNREADABLE), v.UNREADABLE
+        ),
+        "Step 12 of run 7",
+        step_body(
+            produced=UNAVAILABLE_LINE.format("produced", "Produced", "what the step produced"),
+            checks=UNAVAILABLE_LINE.format("checks", "Checks", "the checks of this step"),
+            events=UNAVAILABLE_LINE.format("events", "Events", "the events table"),
+        ),
+        id="every_block_unreadable",
+    ),
+    pytest.param(
+        lambda v: render_step(v, v.UNREADABLE, v.UNREADABLE), "Step 12 of run 7",
+        UNAVAILABLE_LINE.format("step", "Step", "the steps table"),
+        id="an_unreadable_step",
+    ),
+    pytest.param(
+        lambda v: render_step(v, None, step_id=99), "Step not found",
+        STEP_NOT_FOUND_LINE.format(99, 7), id="a_step_not_found",
+    ),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("render, heading, body", STEP_DOCUMENTS)
+def test_render_step_page_is_exactly_the_planned_document_for(
+    viewer, render, heading, body
+):
+    assert render(viewer) == document(f"{heading} - tomfactory viewer", heading, body)
+
+
+def test_render_step_page_escapes_every_stored_text_at_once(viewer):
+    nasty = "<u>&\"'"
+    checks = (viewer.Check(nasty, False, nasty),)
+    step = step_detail(
+        viewer, nasty, {nasty: nasty}, name=nasty, persona=nasty, checks=checks
+    )
+    page = render_step(viewer, step, (viewer.Event(1, CREATED_DT, nasty, nasty),))
+    assert nasty not in page
+    assert page.count(html.escape(nasty)) == 9
+
+
 # --------------------------------------------------------------------- the HTTP server
 
 # Each page: its path, and the page the two lower layers give for it.
@@ -1657,7 +1908,11 @@ PAGES = [
     pytest.param(
         "/runs/7", lambda v: v.render_run_page(v.read_run_page_data(7)), id="run"
     ),
-]
+    pytest.param(
+        "/runs/7/steps/1", lambda v: v.render_step_page(v.read_step_page_data(7, 1)),
+        id="step",
+    ),
+]  # fmt: skip
 
 
 @pytest.mark.parametrize("query", ["", "?x=1"], ids=["no_query", "query_string"])
@@ -1666,7 +1921,8 @@ def test_get_answers_200_with_the_page_rendered_from_what_was_read(
     viewer, home, port, path, page, query
 ):
     # Every run and step here has ended, so no page depends on when it was read.
-    make_run_db(home, runs=[{"request": "café ✓", "reason": "terminé ✓"}], steps=[{}])
+    run = {"request": "café ✓", "reason": "terminé ✓"}
+    make_run_db(home, runs=[run], steps=[{"asked": "écris ✓"}], events=[{}])
     status, headers, body = fetch(port, path + query)
     assert status == 200
     assert headers["Content-Type"].replace(" ", "").lower() == "text/html;charset=utf-8"
@@ -1701,12 +1957,24 @@ def test_get_run_page_for_an_unknown_id_returns_404_with_the_run_not_found_page(
     assert text == viewer.render_run_page(viewer.RunPageData(99, None, (), ENDED_DT))
 
 
+@pytest.mark.parametrize("run_id, step_id", MISSING_STEPS, ids=MISSING_STEP_IDS)
+def test_get_step_page_answers_404_with_the_step_not_found_page_for(
+    home, port, run_id, step_id
+):
+    make_run_db(home, **TWO_RUNS)
+    status, _, body = fetch(port, f"/runs/{run_id}/steps/{step_id}")
+    line = STEP_NOT_FOUND_LINE.format(step_id, run_id)
+    page = document("Step not found - tomfactory viewer", "Step not found", line)
+    assert (status, body.decode("utf-8")) == (404, page)
+
+
 # Paths that are not served: not a page, or not the page of a run with a plain id of
 # at most eighteen digits.
 NOT_RUN_PAGE_PATHS = (
     "/nope /index.html /runs.html /runs/ /runs/abc /runs/0 /runs/07 /runs/007 /runs/7/ "
     "/runs/1234567890123456789 /runs/-7 /runs/+7 /runs/7.0 /runs/7abc /runs/abc7 "
-    "/runs/0x7 /runs/7/steps /runs//7 /runs/7/?x=1 /Runs/7 /run/7 /7"
+    "/runs/0x7 /runs/7/steps /runs//7 /runs/7/?x=1 /Runs/7 /run/7 /7 "
+    "/runs/7/steps/ /runs/7/steps/0 /runs/7/steps/abc /runs/7/steps/1/"
 ).split()
 
 
@@ -1745,7 +2013,7 @@ def test_get_run_page_accepts_an_id_of_eighteen_digits_but_not_of_nineteen(
 
 
 def test_the_runs_link_on_the_home_page_leads_on_to_the_page_of_a_run(home, port):
-    make_run_db(home, runs=[{"request": "reached from the home page"}])
+    make_run_db(home, runs=[{"request": "reached from the home page"}], steps=[{}])
     _, _, home_body = fetch(port)
     runs_link = re.search(
         r'<a id="runs-link" href="([^"]+)">', home_body.decode("utf-8")
@@ -1762,6 +2030,13 @@ def test_the_runs_link_on_the_home_page_leads_on_to_the_page_of_a_run(home, port
         '<dd id="run-request">reached from the home page</dd>'
         in run_body.decode("utf-8")
     )
+    step_link = re.search(
+        r'<td class="step-name"><a href="([^"]+)">test</a></td>', run_body.decode("utf-8")
+    )
+    assert step_link is not None
+    status, _, step_body_bytes = fetch(port, step_link.group(1))
+    assert status == 200
+    assert "<h1>Step 1 of run 7</h1>" in step_body_bytes.decode("utf-8")
 
 
 def test_post_to_root_is_not_implemented(home, port):
